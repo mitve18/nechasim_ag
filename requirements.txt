@@ -1,0 +1,29 @@
+# ===== סוכן חוזים - יחידת נכסים: חבילות נדרשות =====
+# Agent framework (הסוכן היחיד, Toolkit, PgVector, PostgresDb)
+agno>=3.1,<4
+openai>=1.68
+
+# שרת Web
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9   # העלאת קבצים (UploadFile)
+
+# Postgres / PgVector (Supabase)
+sqlalchemy>=2.0
+psycopg[binary]>=3.2
+pgvector>=0.3
+
+# פיענוח PDF ותמונות (בדיקת טקסט דיגיטלי + המרה לתמונה ל-OCR)
+pymupdf>=1.24
+
+# Google Drive API
+google-api-python-client>=2.140
+google-auth>=2.30
+
+# יצירת מסמכי Word
+python-docx>=1.1
+
+# הגדרות ומשתני סביבה
+pydantic>=2.7
+pydantic-settings>=2.3
+python-dotenv>=1.0

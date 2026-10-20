@@ -1,0 +1,54 @@
+# ======================================================================
+# render.yaml - הגדרת התשתית ב-Render (Blueprint)
+#
+# 1. contracts-agent (Web Service): שרת FastAPI שמגיש את ה-API ואת ממשק ה-Web.
+#    - Worker יחיד של Uvicorn: חוסך זיכרון (כל Worker טוען עותק של PyMuPDF,
+#      הסוכן וה-Pool) - מתאים ל-Instance של 512MB.
+# 2. contracts-nightly-sync (Cron Job): פעם בלילה שולח בקשת POST קלה לשרת.
+#    ה-Cron עצמו לא מתקין את התלויות ולא מעבד קבצים - רק curl - ולכן הוא רץ
+#    שניות ספורות. העבודה עצמה (Delta Sync) רצה בשרת ומעבדת רק קבצים שהשתנו.
+#
+# משתנים עם sync: false מוזנים ידנית בלוח הבקרה של Render (סודות לא נשמרים ב-Git).
+# ======================================================================
+services:
+  - type: web
+    name: contracts-agent
+    runtime: python
+    plan: starter
+    region: frankfurt
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT --workers 1 --timeout-keep-alive 75
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DRIVE_CONTRACTS_FOLDER_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON   # תוכן קובץ service_account.json כולו
+        sync: false
+      - key: SYNC_JOB_SECRET
+        generateValue: true                # Render מייצר סוד אקראי
+
+  - type: cron
+    name: contracts-nightly-sync
+    runtime: python
+    plan: starter
+    region: frankfurt
+    schedule: "0 1 * * *"                  # 01:00 UTC = 03:00/04:00 שעון ישראל
+    buildCommand: echo "no build needed"
+    startCommand: >-
+      curl -fsS -X POST "$APP_URL/api/sync"
+      -H "X-Sync-Secret: $SYNC_JOB_SECRET"
+      --retry 3 --retry-delay 30 --max-time 120
+    envVars:
+      - key: APP_URL                       # הכתובת הציבורית של ה-Web Service, למשל https://contracts-agent.onrender.com
+        sync: false
+      - key: SYNC_JOB_SECRET
+        fromService:
+          type: web
+          name: contracts-agent
+          envVarKey: SYNC_JOB_SECRET

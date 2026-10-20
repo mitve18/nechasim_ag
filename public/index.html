@@ -1,0 +1,102 @@
+<!doctype html>
+<!--
+  index.html - ממשק ה-Web של סוכן החוזים (עברית מלאה, RTL).
+
+  מבנה המסך:
+    - סרגל עליון: שם המערכת, כפתור סנכרון ומתג ערכת נושא (כהה/בהיר).
+    - פאנל צד: רשימת הקבצים בתיקיית החוזים בדרייב, אזור גרירה להעלאה, סטטוס אינדוקס ומחיקה.
+    - פאנל ראשי: צ'אט עם הסוכן + כפתורי אנליזה מהירה.
+
+  הדף סטטי לחלוטין ומוגש ע"י FastAPI מתיקיית public - אין שלב Build ואין צורך
+  בשרת נוסף ב-Render. הספריות היחידות: marked (Markdown) ו-DOMPurify (סינון HTML).
+-->
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>סוכן חוזים | יחידת נכסים</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+  <script>
+    // החלת ערכת הנושא לפני הציור הראשון - מונע "הבהוב" של ערכה שגויה
+    try {
+      const t = localStorage.getItem("theme");
+      if (t) document.documentElement.dataset.theme = t;
+    } catch (_) {}
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">§</span>
+      <div>
+        <h1>סוכן חוזים והסכמים</h1>
+        <p class="subtitle">יחידת נכסים · MITVE TOOLS - NECHASIM - CONTRACTS</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <button id="syncBtn" class="btn btn-ghost" title="סנכרון Delta מול הדרייב">
+        <span class="icon" aria-hidden="true">⟳</span> סנכרון
+      </button>
+      <button id="newChatBtn" class="btn btn-ghost" title="התחלת שיחה חדשה">שיחה חדשה</button>
+      <button id="themeBtn" class="btn btn-icon" aria-label="החלפת ערכת נושא">◐</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- פאנל קבצים -->
+    <aside class="panel files-panel" aria-label="קבצים בדרייב">
+      <div class="panel-head">
+        <h2>חוזים בדרייב</h2>
+        <span id="fileCount" class="badge">0</span>
+      </div>
+
+      <label id="dropZone" class="dropzone" for="fileInput">
+        <input id="fileInput" type="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.webp" multiple hidden />
+        <strong>גרור לכאן קבצים</strong>
+        <span>או לחץ לבחירה · PDF / תמונות סרוקות</span>
+      </label>
+
+      <input id="fileSearch" class="input" type="search" placeholder="סינון לפי שם קובץ…" />
+
+      <ul id="fileList" class="file-list" aria-live="polite"></ul>
+      <p id="syncInfo" class="muted small"></p>
+    </aside>
+
+    <!-- פאנל צ'אט -->
+    <section class="panel chat-panel" aria-label="צ'אט עם הסוכן">
+      <div class="quick-actions">
+        <button class="chip" data-analysis="expiring">⏳ חוזים שמסתיימים</button>
+        <button class="chip" data-analysis="financial">₪ סיכום תנאים כספיים</button>
+        <button class="chip" data-analysis="risks">⚠ סעיפי סיכון</button>
+        <button class="chip" data-analysis="status">◉ סטטוס אינדקס</button>
+      </div>
+
+      <div id="messages" class="messages" aria-live="polite">
+        <div class="empty-state">
+          <h3>שלום, במה אפשר לעזור?</h3>
+          <p>שאל על כל חוזה בתיקייה: צדדים, תוקף, דמי שכירות, גוש/חלקה, אופציות וסעיפים מיוחדים.</p>
+          <div class="examples">
+            <button class="example">מה גובה דמי השכירות בחוזה של גוש 6623?</button>
+            <button class="example">השווה בין שני החוזים האחרונים בנושא אופציית הארכה</button>
+            <button class="example">הפק מסמך Word עם סיכום החוזים שמסתיימים השנה</button>
+          </div>
+        </div>
+      </div>
+
+      <form id="chatForm" class="composer">
+        <textarea id="chatInput" rows="1" placeholder="כתוב שאלה על החוזים… (Enter לשליחה, Shift+Enter לשורה חדשה)" required></textarea>
+        <button id="sendBtn" class="btn btn-primary" type="submit">שליחה</button>
+      </form>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
