@@ -9,7 +9,8 @@ uvicorn[standard]>=0.30
 python-multipart>=0.0.9   # העלאת קבצים (UploadFile)
 
 # Postgres / PgVector (Supabase)
-sqlalchemy>=2.0
+sqlalchemy[asyncio]>=2.0.30
+greenlet>=3.0.0           # נדרש ל-sqlalchemy[asyncio]; מוצהר במפורש כדי שיותקן גם בסביבות בלי wheel אוטומטי
 psycopg[binary]>=3.2
 pgvector>=0.3
 
@@ -27,6 +28,3 @@ python-docx>=1.1
 pydantic>=2.7
 pydantic-settings>=2.3
 python-dotenv>=1.0
-
-greenlet>=3.0.0
-sqlalchemy[asyncio]>=2.0.30

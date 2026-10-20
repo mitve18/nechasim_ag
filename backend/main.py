@@ -283,3 +283,10 @@ def health() -> Dict[str, str]:
 
 # הגשת ממשק ה-Web - חייב להיות אחרון, כדי לא "לבלוע" את נתיבי ה-API
 app.mount("/", StaticFiles(directory=settings.PUBLIC_DIR, html=True), name="public")
+
+
+if __name__ == "__main__":
+    # הרצה ישירה (python -m backend.main): הפורט נלקח מ-$PORT של Render, ברירת מחדל 8000 לפיתוח מקומי
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=port, proxy_headers=True, forwarded_allow_ips="*")
