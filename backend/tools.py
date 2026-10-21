@@ -6,7 +6,8 @@ tools.py - מחלקת הכלים היחידה של הסוכן: ContractsToolkit.
         1. חיפוש ושליפה     - search_contracts, get_contract_metadata
         2. אנליזה            - list_expiring_contracts, summarize_contract, compare_contracts
         3. אינדוקס           - get_index_status
-        4. הפקת מסמכים       - prepare_document, generate_word_document
+        4. הפקת מסמכים       - list_document_templates, generate_document_from_template,
+                               generate_word_document (מסמך חופשי ללא תבנית)
 
     פעולות ניהול הדרייב (מחיקה, סנכרון, רשימת קבצים) קיימות בממשק בלבד ולא כאן:
     כך הגדרות הכלים שנשלחות בכל קריאה קטנות יותר, והסוכן לא יכול למחוק קובץ בטעות.
@@ -21,7 +22,7 @@ tools.py - מחלקת הכלים היחידה של הסוכן: ContractsToolkit.
     - search_contracts מחלק את תקציב התווים בין המקטעים *לפני* ההמרה ל-JSON, כך
       שכל 5 המקטעים מגיעים למודל (ולא 2 מקטעים ו-JSON שבור), ושורת ההקשר של כל
       קובץ נשלחת פעם אחת בלבד גם כשכמה מקטעים מגיעים מאותו חוזה.
-    - במסמכים מובנים המודל מחזיר רק ערכי שדות - לא את כל גוף המסמך.
+    - במסמך מתבנית המודל מחזיר רק ערכי משתנים (JSON קצר) - לא את כל גוף המסמך.
 """
 
 from __future__ import annotations
@@ -33,9 +34,9 @@ from typing import Any, Dict, List
 from agno.tools import Toolkit
 
 from backend.config import Settings
-from backend.doc_templates import DOC_TYPES, prefill_from_metadata, render_body
 from backend.services.docx_service import DocxService
 from backend.services.rag_service import RagService
+from backend.services.template_service import TemplateService
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +45,16 @@ class ContractsToolkit(Toolkit):
     """
     ארגז הכלים של סוכן החוזים.
 
-    מקבל את השירותים המשותפים (RAG, Word) בבנאי - כך אין חיבורים כפולים
+    מקבל את השירותים המשותפים (RAG, Word, תבניות) בבנאי - כך אין חיבורים כפולים
     ל-Postgres או לדרייב, והזיכרון של התהליך נשאר נמוך.
     """
 
-    def __init__(self, settings: Settings, rag: RagService, docx: DocxService):
+    def __init__(self, settings: Settings, rag: RagService, docx: DocxService, templates: TemplateService):
         """רושם את כל הכלים במפורש, לפי סדר הקטגוריות."""
         self.settings = settings
         self.rag = rag
         self.docx = docx
+        self.templates = templates
         super().__init__(
             name="contracts_toolkit",
             tools=[
@@ -66,7 +68,8 @@ class ContractsToolkit(Toolkit):
                 # 3. אינדוקס
                 self.get_index_status,
                 # 4. הפקת מסמכים
-                self.prepare_document,
+                self.list_document_templates,
+                self.generate_document_from_template,
                 self.generate_word_document,
             ],
         )
@@ -183,55 +186,42 @@ class ContractsToolkit(Toolkit):
         return self._clip(self.rag.index_status())
 
     # ==================================================================
-    # קטגוריה 4: הפקת מסמכים (אשף)
+    # קטגוריה 4: הפקת מסמכים
     # ==================================================================
-    def prepare_document(self, doc_type: str, file_name: str = "") -> str:
-        """שלב 1 בהפקת מסמך: מחזיר שדות נדרשים, מה כבר ידוע מהחוזה ומה חסר.
+    def list_document_templates(self) -> str:
+        """רשימת תבניות ה-Word בדרייב: id, שם ומשתנים נדרשים."""
+        if not self.settings.DRIVE_TEMPLATES_FOLDER_ID:
+            return "תיקיית תבניות לא הוגדרה (DRIVE_TEMPLATES_FOLDER_ID). אפשר להפיק מסמך חופשי בלבד."
+        items = self.templates.list_templates()
+        return self._clip(items) if items else "אין תבניות בתיקיית התבניות."
+
+    def generate_document_from_template(self, template_file_id: str, context_json: str, title: str = "") -> str:
+        """ממלא תבנית Word מהדרייב ומחזיר קישור להורדה. אם חסרים משתנים - מחזיר את רשימתם.
 
         Args:
-            doc_type: termination_notice / option_exercise / payment_demand / free.
-            file_name: אופציונלי - החוזה שהמסמך מתייחס אליו (למילוי אוטומטי).
+            template_file_id: id מתוך list_document_templates.
+            context_json: JSON של ערכי המשתנים, למשל {"tenant_name": "..."}. רשימות לטבלאות מותרות.
+            title: אופציונלי - שם לקובץ.
         """
-        if doc_type not in DOC_TYPES:
-            return json.dumps({"error": "סוג לא מוכר",
-                               "types": {k: v["title"] for k, v in DOC_TYPES.items()}}, ensure_ascii=False)
-        spec = DOC_TYPES[doc_type]
-        known: Dict[str, str] = {}
-        if file_name:
-            f = self._resolve(file_name)
-            if f:
-                known = prefill_from_metadata(doc_type, f.get("metadata") or {})
-        missing = {k: label for k, label in spec["fields"].items() if k not in known}
-        return json.dumps({
-            "doc_type": doc_type, "title": spec["title"], "known": known,
-            "missing": missing, "optional": spec["optional"],
-            "next": "שאל את המשתמש על השדות החסרים בהודעה אחת, ואז הפעל generate_word_document."
-            if missing else "אפשר להפעיל generate_word_document.",
-        }, ensure_ascii=False)
-
-    def generate_word_document(self, doc_type: str, title: str = "", fields_json: str = "{}",
-                               content_markdown: str = "") -> str:
-        """שלב 2: מפיק מסמך Word (RTL) מתבנית ומחזיר קישור להורדה.
-
-        Args:
-            doc_type: כמו ב-prepare_document.
-            title: כותרת (ריק = כותרת ברירת המחדל של הסוג).
-            fields_json: JSON של ערכי השדות, למשל {"recipient": "..."}. לסוגים מובנים.
-            content_markdown: גוף המסמך ב-Markdown - רק לסוג free.
-        """
-        if doc_type not in DOC_TYPES:
-            doc_type = "free"
         try:
-            fields: Dict[str, str] = {k: str(v) for k, v in json.loads(fields_json or "{}").items()}
-        except (json.JSONDecodeError, AttributeError):
-            return "fields_json אינו JSON תקין."
-        spec = DOC_TYPES[doc_type]
-        missing = [label for k, label in spec["fields"].items() if not fields.get(k)]
-        if missing:
-            return f"חסרים שדות: {', '.join(missing)}. שאל את המשתמש לפני ההפקה."
-        body = content_markdown if spec["body_template"] is None else render_body(doc_type, fields)
-        result = self.docx.build(title or spec["title"], body, fields=fields, doc_type=doc_type)
+            context = json.loads(context_json or "{}")
+        except json.JSONDecodeError as e:
+            return f"context_json אינו JSON תקין: {e}"
+        if not isinstance(context, dict):
+            return "context_json חייב להיות אובייקט JSON ({...})."
+        result = self.templates.render(template_file_id.strip(), context, title=title)
+        if result.get("missing"):
+            result["next"] = "שאל את המשתמש על המשתנים החסרים בהודעה אחת (שדה אופציונלי אפשר לשלוח כ-\"\")."
         return json.dumps(result, ensure_ascii=False)
+
+    def generate_word_document(self, title: str, content_markdown: str) -> str:
+        """מסמך Word חופשי (סיכום/דוח/השוואה) מ-Markdown, כשאין תבנית מתאימה.
+
+        Args:
+            title: כותרת המסמך.
+            content_markdown: גוף המסמך ב-Markdown (כותרות, רשימות, טבלאות, **מודגש**).
+        """
+        return json.dumps(self.docx.build(title, content_markdown), ensure_ascii=False)
 
 
 # ----------------------------------------------------------------------

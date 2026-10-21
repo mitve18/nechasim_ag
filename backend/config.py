@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     # ב-Render: תוכן ה-JSON כולו כמשתנה סביבה (אין צורך להעלות קובץ סודי לשרת)
     GOOGLE_SERVICE_ACCOUNT_JSON: Optional[str] = None
 
+    # --- תבניות Word בדרייב (אופציונלי) ---
+    # תיקייה עם תבניות docx/Google Docs שמכילות משתנים בתחביר Jinja ({{ tenant_name }}).
+    # הסוכן מגלה אותן בעצמו (list_document_templates) וממלא אותן עם docxtpl.
+    DRIVE_TEMPLATES_FOLDER_ID: Optional[str] = None
+    TEMPLATE_LIST_CACHE_SECONDS: int = 300  # רשימת התבניות והמשתנים שלהן נשמרת בזיכרון 5 דקות
+
     # --- מודלים ---
     AGENT_MODEL: str = "gpt-4o"  # מודל הסוכן
     VISION_MODEL: str = "gpt-4o"  # מודל ה-OCR (Vision + Structured Outputs)

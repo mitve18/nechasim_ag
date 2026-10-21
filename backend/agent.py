@@ -38,6 +38,7 @@ from agno.session.summary import SessionSummaryManager
 from backend.config import Settings
 from backend.services.docx_service import DocxService
 from backend.services.rag_service import RagService
+from backend.services.template_service import TemplateService
 from backend.tools import ContractsToolkit
 
 # הוראות המערכת - קצרות וממוקדות, כי הן חלק מכל בקשה למודל.
@@ -49,8 +50,9 @@ INSTRUCTIONS = [
     "הודעה שמתחילה ב-[מיקוד: X] מתייחסת לחוזה X: העבר את X כ-file_name לכלים.",
     "לשאלות על תוקף/סיום חוזים השתמש ב-list_expiring_contracts; לפרטי חוזה - get_contract_metadata.",
     "השתמש ב-summarize_contract רק כשהמשתמש מבקש סיכום של חוזה שלם.",
-    "בקשה למסמך Word: הפעל prepare_document; אם חסרים שדות - שאל עליהם בהודעה אחת קצרה, "
-    "ורק אחרי תשובה הפעל generate_word_document. החזר את download_url כ-Markdown link.",
+    "מסמך מתבנית: list_document_templates ← מלא משתנים מהחוזה (get_contract_metadata) ומהשיחה ← "
+    "אם חסרים, שאל עליהם בהודעה אחת ← generate_document_from_template. "
+    "מסמך חופשי (סיכום/דוח) - generate_word_document. החזר את download_url כ-Markdown link.",
     "אין לך ייעוץ משפטי מחייב; במקרי ספק המלץ להתייעץ עם היועץ המשפטי.",
 ]
 
@@ -93,7 +95,7 @@ class RollingSummaryManager(SessionSummaryManager):
         return messages
 
 
-def build_agent(settings: Settings, rag: RagService, docx: DocxService) -> Agent:
+def build_agent(settings: Settings, rag: RagService, docx: DocxService, templates: TemplateService) -> Agent:
     """
     יוצר את הסוכן היחיד של המערכת.
 
@@ -115,7 +117,7 @@ def build_agent(settings: Settings, rag: RagService, docx: DocxService) -> Agent
     return Agent(
         name="סוכן חוזים - יחידת נכסים",
         model=OpenAIChat(id=settings.AGENT_MODEL, api_key=settings.OPENAI_API_KEY, temperature=0.1),
-        tools=[ContractsToolkit(settings=settings, rag=rag, docx=docx)],
+        tools=[ContractsToolkit(settings=settings, rag=rag, docx=docx, templates=templates)],
         instructions=_instructions,
         db=storage,
         # --- ניהול היסטוריה (חיסכון בטוקנים) ---

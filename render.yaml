@@ -28,6 +28,8 @@ services:
         sync: false
       - key: DRIVE_CONTRACTS_FOLDER_ID
         sync: false
+      - key: DRIVE_TEMPLATES_FOLDER_ID     # תיקיית תבניות ה-Word (docxtpl) - משותפת עם חשבון השירות
+        sync: false
       - key: GOOGLE_SERVICE_ACCOUNT_JSON   # תוכן קובץ service_account.json כולו
         sync: false
       - key: SYNC_JOB_SECRET

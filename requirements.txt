@@ -23,6 +23,7 @@ google-auth>=2.30
 
 # יצירת מסמכי Word
 python-docx>=1.1
+docxtpl>=0.18          # מילוי תבניות Word מהדרייב (משתני Jinja: {{ var }}, {%tr for %})
 
 # הגדרות ומשתני סביבה
 pydantic>=2.7

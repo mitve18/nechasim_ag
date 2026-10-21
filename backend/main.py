@@ -3,7 +3,7 @@ main.py - שרת FastAPI: נתיבי API, נקודת הסנכרון הלילי (
 
 מה הקובץ עושה:
     - מאתחל פעם אחת (ב-lifespan) את השירותים המשותפים: DriveService, RagService,
-      DocxService והסוכן.
+      DocxService, TemplateService (תבניות Word מהדרייב) והסוכן.
     - חושף נתיבי API לצ'אט (רגיל ו-Streaming), לדוחות, להיסטוריית שיחה, לניהול קבצים
       בדרייב ולהפקת מסמכי Word.
     - חושף את POST /api/sync, שמוגן ב-X-Sync-Secret ומופעל ע"י ה-Cron הלילי של Render.
@@ -47,6 +47,7 @@ from backend.config import get_settings
 from backend.services.docx_service import DocxService
 from backend.services.drive_service import SUPPORTED_MIME_TYPES, DriveService, DriveServiceError
 from backend.services.rag_service import RagService
+from backend.services.template_service import TemplateService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("contracts-agent")
@@ -69,7 +70,8 @@ TOOL_STATUS = {
     "summarize_contract": "📖 קורא את החוזה…",
     "compare_contracts": "⚖ משווה חוזים…",
     "get_index_status": "◉ בודק סטטוס אינדקס…",
-    "prepare_document": "📝 מכין טיוטת מסמך…",
+    "list_document_templates": "📂 מחפש תבניות…",
+    "generate_document_from_template": "📝 ממלא תבנית Word…",
     "generate_word_document": "📝 מפיק מסמך Word…",
 }
 
@@ -87,7 +89,9 @@ async def lifespan(app: FastAPI):
     drive = DriveService(settings)
     rag = RagService(settings, drive)
     docx = DocxService(settings, drive, link_resolver=rag.find_link)
-    STATE.update(drive=drive, rag=rag, docx=docx, agent=build_agent(settings, rag, docx))
+    templates = TemplateService(settings, drive)
+    STATE.update(drive=drive, rag=rag, docx=docx, templates=templates,
+                 agent=build_agent(settings, rag, docx, templates))
     logger.info("השירותים אותחלו בהצלחה")
     yield
     rag.engine.dispose()

@@ -82,19 +82,9 @@ class DocxService:
             self._render_sources(doc, sources)
         _move_new_content_to_anchor(doc, before)
 
-        safe_title = re.sub(r"[^\w֐-׿\- ]", "", title).strip().replace(" ", "_")[:60] or "document"
-        filename = f"{safe_title}_{datetime.now():%Y%m%d_%H%M}_{uuid.uuid4().hex[:6]}.docx"
-        path = Path(self.settings.GENERATED_DOCS_DIR) / filename
+        path = output_path(self.settings, title)
         doc.save(path)
-
-        result: Dict[str, Any] = {"download_url": f"/api/docs/{filename}", "file_name": filename}
-        try:
-            backup = self.drive.upload_generated_doc(str(path), filename)
-            if backup:
-                result["drive_link"] = backup.get("webViewLink")
-        except Exception as e:  # noqa: BLE001 - גיבוי שנכשל לא מבטל את ההורדה המקומית
-            logger.warning("גיבוי המסמך לדרייב נכשל: %s", e)
-        return result
+        return publish(self.drive, path)
 
     # ------------------------------------------------------------------
     # תבנית
@@ -171,6 +161,31 @@ class DocxService:
                     link = None
             text = f"[{n}] {file_name}, {section}" + (f" - {link}" if link else "")
             _add_paragraph(doc, text)
+
+
+# ----------------------------------------------------------------------
+# שמירה והחזרת קישור (משותף ל-DocxService ול-TemplateService)
+# ----------------------------------------------------------------------
+def output_path(settings: Settings, title: str) -> Path:
+    """
+    נתיב פלט ייחודי ב-generated_docs. השם מכיל רק אותיות/ספרות/עברית/מקף/קו תחתון,
+    כך שהוא תמיד עובר את האימות של GET /api/docs/{name} (מניעת Path Traversal).
+    """
+    safe_title = re.sub(r"[^\w֐-׿\- ]", "", title).strip().replace(" ", "_")[:60] or "document"
+    filename = f"{safe_title}_{datetime.now():%Y%m%d_%H%M}_{uuid.uuid4().hex[:6]}.docx"
+    return Path(settings.GENERATED_DOCS_DIR) / filename
+
+
+def publish(drive: DriveService, path: Path) -> Dict[str, Any]:
+    """מחזיר קישור הורדה ומגבה לדרייב (Best effort - הדיסק של Render זמני)."""
+    result: Dict[str, Any] = {"download_url": f"/api/docs/{path.name}", "file_name": path.name}
+    try:
+        backup = drive.upload_generated_doc(str(path), path.name)
+        if backup:
+            result["drive_link"] = backup.get("webViewLink")
+    except Exception as e:  # noqa: BLE001 - גיבוי שנכשל לא מבטל את ההורדה המקומית
+        logger.warning("גיבוי המסמך לדרייב נכשל: %s", e)
+    return result
 
 
 # ----------------------------------------------------------------------

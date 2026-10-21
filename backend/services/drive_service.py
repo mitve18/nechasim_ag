@@ -62,6 +62,9 @@ SUPPORTED_MIME_TYPES = {
 }
 
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+# סוגי קבצים שמותר להשתמש בהם כתבנית Word (Google Docs מיוצא ל-docx בהורדה)
+TEMPLATE_MIME_TYPES = {DOCX_MIME, GOOGLE_DOC_MIME}
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
@@ -191,7 +194,7 @@ class DriveService:
             return self.upload_file(
                 local_path,
                 name,
-                mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                mime_type=DOCX_MIME,
                 parent_id=folder_id,
             )
         except Exception as e:  # noqa: BLE001 - גיבוי הוא "Best effort"
@@ -235,23 +238,69 @@ class DriveService:
         file_id = file["id"]
         is_gdoc = file.get("mimeType") == GOOGLE_DOC_MIME
         ext = ".pdf" if is_gdoc else (os.path.splitext(file.get("name", ""))[1] or "")
+        if is_gdoc:
+            request = self._service.files().export_media(fileId=file_id, mimeType="application/pdf")
+        else:
+            request = self._service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        return self._download(request, ext, "הורדת הקובץ")
+
+    def _download(self, request: Any, ext: str, action: str) -> str:
+        """
+        מוריד בקשת get_media/export_media לקובץ זמני בשם אקראי ומחזיר את הנתיב.
+
+        MediaIoBaseDownload כותב ישירות לדיסק, Chunk אחר Chunk. קובץ חלקי (הורדה
+        שנכשלה באמצע) נמחק מיד, כדי לא להשאיר זבל ב-/tmp המוגבל של Render.
+        """
         safe_name = re.sub(r"[^\w.\-]", "_", f"{uuid.uuid4().hex}{ext}")
         local_path = os.path.join(self.settings.TMP_DIR, safe_name)
         try:
-            if is_gdoc:
-                request = self._service.files().export_media(fileId=file_id, mimeType="application/pdf")
-            else:
-                request = self._service.files().get_media(fileId=file_id, supportsAllDrives=True)
             with io.FileIO(local_path, "wb") as fh:
                 downloader = MediaIoBaseDownload(fh, request, chunksize=CHUNK_SIZE)
                 done = False
                 while not done:
                     _, done = downloader.next_chunk(num_retries=NUM_RETRIES)
-        except HttpError as e:
+        except Exception as e:
             if os.path.exists(local_path):
                 os.remove(local_path)
-            raise self._friendly_error(e, "הורדת הקובץ") from e
+            if isinstance(e, HttpError):
+                raise self._friendly_error(e, action) from e
+            raise
         return local_path
+
+    # ------------------------------------------------------------------
+    # תבניות Word (תיקיית התבניות בדרייב)
+    # ------------------------------------------------------------------
+    def list_templates(self) -> List[Dict[str, Any]]:
+        """
+        רשימת תבניות ה-Word בתיקיית התבניות (DRIVE_TEMPLATES_FOLDER_ID).
+
+        נכללים רק קבצי docx ו-Google Docs (שמיוצאים ל-docx בהורדה). התיקייה צריכה
+        להיות משותפת עם חשבון השירות, בדיוק כמו תיקיית החוזים.
+        """
+        folder = self.settings.DRIVE_TEMPLATES_FOLDER_ID
+        if not folder:
+            return []
+        return [f for f in self.list_files(folder_id=folder, only_supported=False)
+                if f.get("mimeType") in TEMPLATE_MIME_TYPES]
+
+    def download_template(self, file_id: str) -> str:
+        """
+        מוריד תבנית Word לקובץ זמני (.docx) ומחזיר את הנתיב. באחריות הקורא למחוק.
+
+        - Google Docs מיוצא לפורמט docx (export_media), כך שאפשר לנהל תבניות גם
+          ישירות ב-Google Docs.
+        - כל סוג קובץ אחר (PDF, ‎.doc ישן וכו') נדחה עם הודעה ברורה - docxtpl
+          עובד רק עם docx.
+        """
+        meta = self.get_file(file_id)
+        mime = meta.get("mimeType")
+        if mime == GOOGLE_DOC_MIME:
+            request = self._service.files().export_media(fileId=file_id, mimeType=DOCX_MIME)
+        elif mime == DOCX_MIME:
+            request = self._service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        else:
+            raise DriveServiceError(f"התבנית '{meta.get('name')}' חייבת להיות קובץ Word (.docx) או Google Doc.")
+        return self._download(request, ".docx", "הורדת התבנית")
 
     # ------------------------------------------------------------------
     # מחיקה
