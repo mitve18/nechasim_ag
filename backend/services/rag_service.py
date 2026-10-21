@@ -43,7 +43,7 @@ import fitz  # PyMuPDF
 from openai import OpenAI
 from pydantic import BaseModel, Field
 from sqlalchemy import (
-    Column, DateTime, Integer, MetaData, String, Table, Text, create_engine, delete, select, text,
+    Column, DateTime, Integer, MetaData, String, Table, Text, case, create_engine, delete, select, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.engine import Engine
@@ -120,7 +120,9 @@ class RagService:
         """
         self.settings = settings
         self.drive = drive
-        self.openai = OpenAI(api_key=settings.OPENAI_API_KEY)
+        # max_retries: ה-SDK של OpenAI מבצע Backoff אקספוננציאלי אוטומטי לשגיאות זמניות
+        # בלבד (429, 5xx, Timeout, ניתוק רשת) - עמוד OCR לא נכשל בגלל עומס רגעי.
+        self.openai = OpenAI(api_key=settings.OPENAI_API_KEY, max_retries=4, timeout=120)
         self._sync_lock = threading.Lock()
 
         self.engine: Engine = create_engine(
@@ -161,11 +163,18 @@ class RagService:
             Column("ocr_pages", Integer, default=0),
             Column("web_link", Text),
             Column("error", Text),
+            Column("retries", Integer, default=0),  # כשלונות רצופים על אותה גרסת קובץ
             Column("indexed_at", DateTime(timezone=True)),
         )
         with self.engine.begin() as conn:
             conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {settings.DB_SCHEMA}"))
         self._metadata.create_all(self.engine)
+        # create_all לא משנה טבלה קיימת - מוסיפים עמודות חדשות ידנית (Idempotent)
+        with self.engine.begin() as conn:
+            conn.execute(text(
+                f"ALTER TABLE {settings.DB_SCHEMA}.{settings.TRACKING_TABLE} "
+                "ADD COLUMN IF NOT EXISTS retries INTEGER DEFAULT 0"
+            ))
 
     # ==================================================================
     # Delta Sync
@@ -191,13 +200,19 @@ class RagService:
                 rows = {r.file_id: r for r in conn.execute(select(self.tracking)).fetchall()}
 
             summary = {"status": "ok", "total": len(drive_files), "new": 0, "updated": 0,
-                       "skipped": 0, "removed": 0, "failed": 0, "errors": []}
+                       "skipped": 0, "removed": 0, "failed": 0, "gave_up": 0, "errors": []}
             drive_ids = set()
             for f in drive_files:
                 drive_ids.add(f["id"])
                 row = rows.get(f["id"])
-                if row and row.fingerprint == f["fingerprint"] and row.status == "indexed":
+                same_version = bool(row) and row.fingerprint == f["fingerprint"]
+                if same_version and row.status == "indexed":
                     summary["skipped"] += 1  # ה-Delta Sync בפעולה: אין שינוי -> אין עלות
+                    continue
+                if same_version and row.status == "error" and (row.retries or 0) >= self.settings.MAX_INDEX_RETRIES:
+                    # קובץ שנכשל שוב ושוב (פגום/מוצפן) לא נשלח ל-OCR יקר בכל לילה;
+                    # ינוסה שוב רק כשתעלה גרסה חדשה שלו (fingerprint שונה)
+                    summary["gave_up"] += 1
                     continue
                 try:
                     self.index_file(f)
@@ -270,12 +285,19 @@ class RagService:
         }
         if status == "indexed":
             values.update(metadata=metadata, chunks=chunks, pages=pages,
-                          ocr_pages=ocr_pages, extraction=extraction)
+                          ocr_pages=ocr_pages, extraction=extraction, retries=0)
+        else:
+            values["retries"] = 1
         stmt = pg_insert(self.tracking).values(**values)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[self.tracking.c.file_id],
-            set_={k: stmt.excluded[k] for k in values if k != "file_id"},
-        )
+        set_ = {k: stmt.excluded[k] for k in values if k != "file_id"}
+        if status == "error":
+            # כשל נוסף על אותה גרסה -> מונה +1; גרסה חדשה של הקובץ -> מתחילים מ-1
+            set_["retries"] = case(
+                (self.tracking.c.fingerprint == stmt.excluded.fingerprint,
+                 self.tracking.c.retries + 1),
+                else_=1,
+            )
+        stmt = stmt.on_conflict_do_update(index_elements=[self.tracking.c.file_id], set_=set_)
         with self.engine.begin() as conn:
             conn.execute(stmt)
 
@@ -532,6 +554,26 @@ class RagService:
         with self.engine.connect() as conn:
             rows = conn.execute(select(self.tracking).order_by(self.tracking.c.name)).mappings().all()
         return [dict(r) for r in rows]
+
+    def index_status(self) -> Dict[str, Any]:
+        """סיכום מצב האינדקס מטבלת המעקב - SQL בלבד, ללא LLM (משמש את הכלי ואת הדוח בממשק)."""
+        rows = self.list_tracked()
+        return {
+            "total": len(rows),
+            "indexed": sum(r["status"] == "indexed" for r in rows),
+            "errors": [{"file": r["name"], "error": (r.get("error") or "")[:150],
+                        "retries": r.get("retries") or 0}
+                       for r in rows if r["status"] == "error"],
+            "chunks": sum(r.get("chunks") or 0 for r in rows),
+            "pages": sum(r.get("pages") or 0 for r in rows),
+            "ocr_pages": sum(r.get("ocr_pages") or 0 for r in rows),
+            "last_indexed": max((r["indexed_at"] for r in rows if r.get("indexed_at")), default=None),
+        }
+
+    def find_link(self, file_name: str) -> Optional[str]:
+        """קישור הדרייב של חוזה לפי שם (לסעיף המקורות במסמכי Word)."""
+        f = self.find_file(file_name)
+        return f.get("web_link") if f else None
 
     def find_file(self, name_or_id: str) -> Optional[Dict[str, Any]]:
         """מאתר חוזה לפי מזהה מדויק או חלק משם הקובץ (ILIKE)."""

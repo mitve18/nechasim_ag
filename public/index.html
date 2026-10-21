@@ -5,7 +5,8 @@
   מבנה המסך:
     - סרגל עליון: שם המערכת, כפתור סנכרון ומתג ערכת נושא (כהה/בהיר).
     - פאנל צד: רשימת הקבצים בתיקיית החוזים בדרייב, אזור גרירה להעלאה, סטטוס אינדוקס ומחיקה.
-    - פאנל ראשי: צ'אט עם הסוכן + כפתורי אנליזה מהירה.
+    - פאנל ראשי: צ'אט עם הסוכן (Streaming) + דוחות מהירים + צ'יפ מיקוד בחוזה.
+    - חלון כרטיס חוזה (dialog): מטא-דאטה, מיקוד, ניסיון אינדוקס חוזר ומחיקה.
 
   הדף סטטי לחלוטין ומוגש ע"י FastAPI מתיקיית public - אין שלב Build ואין צורך
   בשרת נוסף ב-Render. הספריות היחידות: marked (Markdown) ו-DOMPurify (סינון HTML).
@@ -59,6 +60,11 @@
         <span>או לחץ לבחירה · PDF / תמונות סרוקות</span>
       </label>
 
+      <div id="uploadProgress" class="upload-progress" hidden>
+        <div class="upload-bar"><i></i></div>
+        <span class="small muted"></span>
+      </div>
+
       <input id="fileSearch" class="input" type="search" placeholder="סינון לפי שם קובץ…" />
 
       <ul id="fileList" class="file-list" aria-live="polite"></ul>
@@ -68,30 +74,53 @@
     <!-- פאנל צ'אט -->
     <section class="panel chat-panel" aria-label="צ'אט עם הסוכן">
       <div class="quick-actions">
-        <button class="chip" data-analysis="expiring">⏳ חוזים שמסתיימים</button>
-        <button class="chip" data-analysis="financial">₪ סיכום תנאים כספיים</button>
-        <button class="chip" data-analysis="risks">⚠ סעיפי סיכון</button>
-        <button class="chip" data-analysis="status">◉ סטטוס אינדקס</button>
+        <!-- data-report: נשלף ישירות מ-SQL (0 טוקנים) · data-analysis: דורש LLM -->
+        <button class="chip" data-report="expiring" title="מיידי, ללא עלות טוקנים">⏳ חוזים שמסתיימים</button>
+        <button class="chip" data-report="financial" title="מיידי, ללא עלות טוקנים">₪ תנאים כספיים</button>
+        <button class="chip" data-report="status" title="מיידי, ללא עלות טוקנים">◉ סטטוס אינדקס</button>
+        <button class="chip" data-analysis="risks" title="ניתוח AI של סעיפי החוזים">⚠ סעיפי סיכון</button>
       </div>
 
-      <div id="messages" class="messages" aria-live="polite">
+      <div id="messages" class="messages" aria-live="polite"></div>
+
+      <template id="emptyStateTpl">
         <div class="empty-state">
           <h3>שלום, במה אפשר לעזור?</h3>
           <p>שאל על כל חוזה בתיקייה: צדדים, תוקף, דמי שכירות, גוש/חלקה, אופציות וסעיפים מיוחדים.</p>
           <div class="examples">
             <button class="example">מה גובה דמי השכירות בחוזה של גוש 6623?</button>
             <button class="example">השווה בין שני החוזים האחרונים בנושא אופציית הארכה</button>
-            <button class="example">הפק מסמך Word עם סיכום החוזים שמסתיימים השנה</button>
+            <button class="example">הפק מכתב הודעה על סיום חוזה לשוכר</button>
           </div>
         </div>
-      </div>
+      </template>
 
-      <form id="chatForm" class="composer">
-        <textarea id="chatInput" rows="1" placeholder="כתוב שאלה על החוזים… (Enter לשליחה, Shift+Enter לשורה חדשה)" required></textarea>
-        <button id="sendBtn" class="btn btn-primary" type="submit">שליחה</button>
-      </form>
+      <button id="jumpBtn" class="jump-btn" type="button" hidden>↓ הודעה חדשה</button>
+
+      <div class="composer-wrap">
+        <div id="focusBar" class="focus-bar" hidden></div>
+        <form id="chatForm" class="composer">
+          <textarea id="chatInput" rows="1" placeholder="כתוב שאלה על החוזים… (Enter לשליחה, Shift+Enter לשורה חדשה)"></textarea>
+          <button id="sendBtn" class="btn btn-primary" type="submit">שליחה</button>
+        </form>
+      </div>
     </section>
   </main>
+
+  <!-- כרטיס חוזה: מטא-דאטה מקומי, ללא LLM -->
+  <dialog id="fileDialog" class="file-dialog">
+    <form method="dialog" class="dialog-head">
+      <h3 id="fdTitle"></h3>
+      <button class="btn-icon" aria-label="סגירה">✕</button>
+    </form>
+    <dl id="fdMeta" class="meta-grid"></dl>
+    <div class="dialog-actions">
+      <button id="fdFocus" class="btn btn-primary" type="button">📎 שאל על החוזה הזה</button>
+      <a id="fdLink" class="btn btn-ghost" target="_blank" rel="noopener">פתח בדרייב</a>
+      <button id="fdReindex" class="btn btn-ghost" type="button" hidden>⟳ נסה לאנדקס שוב</button>
+      <button id="fdDelete" class="btn btn-ghost danger" type="button">🗑 מחיקה</button>
+    </div>
+  </dialog>
 
   <div id="toast" class="toast" role="status" hidden></div>
 

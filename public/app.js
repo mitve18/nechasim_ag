@@ -2,16 +2,18 @@
   app.js - לוגיקת ה-Frontend של סוכן החוזים.
 
   אחריות:
-    1. צ'אט: שליחת הודעות ל-/api/chat, הצגת תשובות Markdown (marked + DOMPurify).
-    2. קבצים: טעינת הרשימה מ-/api/files, העלאה (גרירה/בחירה), מחיקה, סינון.
-    3. כפתורי אנליזה: קריאה ל-/api/analysis/{kind}.
-    4. סנכרון ידני: /api/files/refresh + מעקב עד לסיום.
-    5. ערכת נושא (כהה/בהיר) ו-session_id נשמרים ב-localStorage.
+    1. צ'אט ב-Streaming: /api/chat/stream (NDJSON) - טקסט מופיע בהדרגה, עם חיווי
+       "מחפש בחוזים…" בזמן הפעלת כלים, וכפתור "עצור".
+    2. שחזור השיחה אחרי רענון: /api/sessions/{id}/messages.
+    3. דוחות מהירים: /api/reports/{kind} - SQL ישיר, 0 טוקנים.
+    4. פעולות על תשובה: העתקה, העתקת טבלה לאקסל, ייצוא ל-Word, צ'יפים של מקורות.
+    5. קבצים: רשימה, כרטיס חוזה (מטא-דאטה מקומי), מיקוד בחוזה, העלאה עם התקדמות, מחיקה.
+    6. סנכרון ידני וערכת נושא.
 
   חיסכון בטוקנים בצד הלקוח:
-    - session_id קבוע לשיחה: השרת טוען רק את 4 הסבבים האחרונים מ-Postgres, ולכן
-      הלקוח לא שולח את כל ההיסטוריה בכל בקשה - רק את ההודעה החדשה.
-    - "שיחה חדשה" יוצרת session_id חדש, כך שנושא חדש לא סוחב היסטוריה לא רלוונטית.
+    - session_id קבוע לשיחה: השרת טוען רק את הסבבים האחרונים + סיכום, ולא כל ההיסטוריה.
+    - כרטיס חוזה ודוחות לא מפעילים את המודל בכלל.
+    - "ייצוא ל-Word" ממיר תשובה קיימת - המודל לא כותב אותה שוב.
 */
 
 (() => {
@@ -26,25 +28,34 @@
   const $ = (sel) => document.querySelector(sel);
   const els = {
     messages: $("#messages"),
+    emptyTpl: $("#emptyStateTpl"),
     form: $("#chatForm"),
     input: $("#chatInput"),
     send: $("#sendBtn"),
+    jump: $("#jumpBtn"),
+    focusBar: $("#focusBar"),
     fileList: $("#fileList"),
     fileCount: $("#fileCount"),
     fileInput: $("#fileInput"),
     dropZone: $("#dropZone"),
     fileSearch: $("#fileSearch"),
+    uploadProgress: $("#uploadProgress"),
     syncBtn: $("#syncBtn"),
     syncInfo: $("#syncInfo"),
     themeBtn: $("#themeBtn"),
     newChatBtn: $("#newChatBtn"),
     toast: $("#toast"),
+    dialog: $("#fileDialog"),
   };
 
   let sessionId = store.get("session_id") || newSessionId();
   let files = [];
+  let maxRetries = 3;
   let busy = false;
+  let controller = null; // AbortController של הבקשה הפעילה
+  let focusFile = null; // שם החוזה שהשיחה ממוקדת בו
   let pollTimer = null;
+  const rawMarkdown = new WeakMap(); // בועה -> Markdown המקורי (להעתקה/ייצוא)
 
   const STATUS_LABELS = {
     indexed: "מאונדקס",
@@ -54,10 +65,18 @@
     error: "שגיאה",
   };
 
+  const META_LABELS = [
+    ["parties", "צדדים"],
+    ["property", "נכס"],
+    ["block_parcel", "גוש/חלקה"],
+    ["start_date", "תחילה"],
+    ["end_date", "סיום"],
+    ["financial_terms", "תנאים כספיים"],
+  ];
+
   // ======================================================================
   // עזרים כלליים
   // ======================================================================
-  /** יוצר מזהה שיחה חדש ושומר אותו. */
   function newSessionId() {
     const id = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()).replace(/-/g, "");
     store.set("session_id", id);
@@ -69,14 +88,17 @@
     const res = await fetch(path, options);
     let data = null;
     try { data = await res.json(); } catch (_) {}
-    if (!res.ok) {
-      const detail = data && data.detail;
-      throw new Error(typeof detail === "string" ? detail : `שגיאת שרת (${res.status})`);
-    }
+    if (!res.ok) throw new Error(errorDetail(data, res.status));
     return data;
   }
 
-  /** הודעה קצרה בתחתית המסך. */
+  function errorDetail(data, status) {
+    const d = data && data.detail;
+    if (typeof d === "string") return d;
+    if (Array.isArray(d) && d[0] && d[0].msg) return d[0].msg;
+    return `שגיאת שרת (${status})`;
+  }
+
   function toast(text, ms = 3500) {
     els.toast.textContent = text;
     els.toast.hidden = false;
@@ -86,7 +108,7 @@
 
   /** ממיר Markdown ל-HTML בטוח (DOMPurify מונע הזרקת סקריפטים מתשובות המודל). */
   function renderMarkdown(md) {
-    const html = window.marked ? marked.parse(md || "") : (md || "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    const html = window.marked ? marked.parse(md || "") : escapeHtml(md || "");
     return window.DOMPurify ? DOMPurify.sanitize(html) : html;
   }
 
@@ -101,70 +123,212 @@
   }
 
   // ======================================================================
-  // צ'אט
+  // גלילה חכמה: גוללים למטה רק אם המשתמש כבר היה בתחתית
   // ======================================================================
-  /** מוסיף בועת הודעה לחלון הצ'אט ומחזיר את האלמנט. */
-  function addMessage(role, content, { html = false, extraClass = "" } = {}) {
+  const nearBottom = () => els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight < 80;
+
+  /** מריץ עדכון DOM ושומר על "הדבקה לתחתית" רק אם המשתמש היה שם לפני העדכון. */
+  function withScroll(update) {
+    const stick = nearBottom();
+    update();
+    if (stick) els.messages.scrollTop = els.messages.scrollHeight;
+    else els.jump.hidden = false;
+  }
+
+  els.messages.addEventListener("scroll", () => { if (nearBottom()) els.jump.hidden = true; });
+  els.jump.addEventListener("click", () => {
+    els.messages.scrollTo({ top: els.messages.scrollHeight, behavior: "smooth" });
+    els.jump.hidden = true;
+  });
+
+  // ======================================================================
+  // בועות הודעה
+  // ======================================================================
+  function showEmptyState() {
+    els.messages.innerHTML = "";
+    els.messages.appendChild(els.emptyTpl.content.cloneNode(true));
+  }
+
+  function clearEmptyState() {
     const empty = els.messages.querySelector(".empty-state");
     if (empty) empty.remove();
+  }
+
+  function addUserMessage(text, focus) {
+    clearEmptyState();
     const div = document.createElement("div");
-    div.className = `msg msg-${role} ${extraClass}`.trim();
-    if (html) div.innerHTML = content; else div.textContent = content;
+    div.className = "msg msg-user";
+    if (focus) {
+      const tag = document.createElement("span");
+      tag.className = "msg-focus";
+      tag.textContent = `📎 ${focus}`;
+      div.appendChild(tag);
+    }
+    div.appendChild(document.createTextNode(text));
     els.messages.appendChild(div);
-    els.messages.scrollTop = els.messages.scrollHeight;
+    els.messages.scrollTop = els.messages.scrollHeight; // הודעה של המשתמש עצמו - תמיד גוללים
     return div;
   }
 
-  /** שולח שאלה (או מפעיל אנליזה) ומציג את התשובה. */
-  async function ask({ message, analysis }) {
-    if (busy) return;
-    busy = true;
-    els.send.disabled = true;
-    if (message) addMessage("user", message);
-    const pending = addMessage("bot", '<span class="typing"><i></i><i></i><i></i></span>', { html: true });
-    try {
-      const data = analysis
-        ? await api(`/api/analysis/${analysis}?session_id=${encodeURIComponent(sessionId)}`, { method: "POST" })
-        : await api("/api/chat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message, session_id: sessionId }),
-          });
-      sessionId = data.session_id || sessionId;
-      store.set("session_id", sessionId);
-      pending.innerHTML = renderMarkdown(data.answer || "לא התקבלה תשובה.");
-      if (data.tokens) {
-        const t = document.createElement("span");
-        t.className = "tokens";
-        t.textContent = `${data.tokens.toLocaleString("he-IL")} טוקנים`;
-        pending.appendChild(t);
-      }
-      // אם הסוכן מחק קובץ או הריץ סנכרון - נרענן את רשימת הקבצים
-      loadFiles();
-    } catch (err) {
-      pending.classList.add("msg-error");
-      pending.textContent = `שגיאה: ${err.message}`;
-    } finally {
-      busy = false;
-      els.send.disabled = false;
-      els.messages.scrollTop = els.messages.scrollHeight;
+  /** יוצר בועת סוכן ריקה עם אזורי סטטוס, תוכן, מקורות ופעולות. */
+  function addBotMessage() {
+    clearEmptyState();
+    const div = document.createElement("div");
+    div.className = "msg msg-bot";
+    div.innerHTML = `
+      <div class="msg-status"><span class="typing"><i></i><i></i><i></i></span><span class="status-text"></span></div>
+      <div class="msg-body"></div>
+      <div class="msg-sources"></div>
+      <div class="msg-footer" hidden>
+        <span class="tokens"></span>
+        <div class="msg-actions">
+          <button class="icon-btn" data-msg-action="copy" title="העתקה">⧉ העתק</button>
+          <button class="icon-btn" data-msg-action="table" title="העתקת הטבלה להדבקה באקסל" hidden>▦ העתק טבלה</button>
+          <button class="icon-btn" data-msg-action="word" title="ייצוא למסמך Word (ללא עלות טוקנים)">⇩ Word</button>
+        </div>
+      </div>`;
+    withScroll(() => els.messages.appendChild(div));
+    return div;
+  }
+
+  function setBotStatus(bubble, text) {
+    const st = bubble.querySelector(".msg-status");
+    st.hidden = !text && !!rawMarkdown.get(bubble);
+    st.querySelector(".status-text").textContent = text || "";
+  }
+
+  function setBotBody(bubble, md) {
+    rawMarkdown.set(bubble, md);
+    withScroll(() => { bubble.querySelector(".msg-body").innerHTML = renderMarkdown(md); });
+  }
+
+  /** סוגר בועה: מסתיר סטטוס, מציג מקורות, טוקנים וכפתורי פעולה. */
+  function finishBotMessage(bubble, { tokens, cached_tokens, sources, note } = {}) {
+    bubble.querySelector(".msg-status").hidden = true;
+    const src = bubble.querySelector(".msg-sources");
+    src.innerHTML = (sources || []).map((s) => {
+      const label = `📄 ${escapeHtml(s.file)}${s.sections && s.sections.length ? ` · ${escapeHtml(s.sections.join(", "))}` : ""}`;
+      return s.link
+        ? `<a class="source-chip" href="${escapeHtml(s.link)}" target="_blank" rel="noopener" title="פתח בדרייב">${label}</a>`
+        : `<span class="source-chip">${label}</span>`;
+    }).join("");
+
+    const footer = bubble.querySelector(".msg-footer");
+    const t = footer.querySelector(".tokens");
+    if (note) t.textContent = note;
+    else if (tokens) {
+      t.textContent = `${tokens.toLocaleString("he-IL")} טוקנים` +
+        (cached_tokens ? ` (${cached_tokens.toLocaleString("he-IL")} מהמטמון)` : "");
     }
+    footer.querySelector('[data-msg-action="table"]').hidden = !bubble.querySelector(".msg-body table");
+    footer.hidden = !rawMarkdown.get(bubble);
+    withScroll(() => {});
+  }
+
+  // ======================================================================
+  // מצב עומס
+  // ======================================================================
+  function setBusy(value) {
+    busy = value;
+    els.send.textContent = value ? "■ עצור" : "שליחה";
+    els.send.classList.toggle("btn-stop", value);
+    document.querySelectorAll(".chip, .example").forEach((b) => { b.disabled = value; });
+  }
+
+  // ======================================================================
+  // צ'אט ב-Streaming
+  // ======================================================================
+  /** שולח בקשה ל-/api/chat/stream ומעדכן את הבועה לפי האירועים (NDJSON). */
+  async function streamChat(payload) {
+    const bubble = addBotMessage();
+    setBusy(true);
+    controller = new AbortController();
+    let text = "";
+    let renderTimer = null;
+    let done = null;
+    const flush = () => { renderTimer = null; setBotBody(bubble, text); };
+
+    try {
+      const res = await fetch("/api/chat/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, session_id: sessionId }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        let data = null;
+        try { data = await res.json(); } catch (_) {}
+        throw new Error(errorDetail(data, res.status));
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done: end } = await reader.read();
+        if (end) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          const ev = JSON.parse(line);
+          if (ev.type === "delta") {
+            text += ev.text;
+            setBotStatus(bubble, "");
+            // רינדור Markdown לכל היותר כל 80ms - חוסך עבודה לדפדפן בתשובות ארוכות
+            if (!renderTimer) renderTimer = setTimeout(flush, 80);
+          } else if (ev.type === "status") {
+            setBotStatus(bubble, ev.text);
+          } else if (ev.type === "done") {
+            done = ev;
+          } else if (ev.type === "error") {
+            throw new Error(ev.text);
+          }
+        }
+      }
+      clearTimeout(renderTimer);
+      setBotBody(bubble, text || "לא התקבלה תשובה.");
+      finishBotMessage(bubble, done || {});
+    } catch (err) {
+      clearTimeout(renderTimer);
+      if (err.name === "AbortError") {
+        setBotBody(bubble, (text || "") + "\n\n_— נעצר —_");
+        finishBotMessage(bubble, { note: "התשובה נעצרה" });
+      } else {
+        if (text) setBotBody(bubble, text);
+        bubble.classList.add("msg-error");
+        const st = bubble.querySelector(".msg-status");
+        st.hidden = false;
+        st.innerHTML = `<span class="status-text">שגיאה: ${escapeHtml(err.message)}</span>`;
+      }
+    } finally {
+      controller = null;
+      setBusy(false);
+    }
+  }
+
+  function sendMessage(text) {
+    if (busy || !text) return;
+    addUserMessage(text, focusFile);
+    streamChat({ message: text, focus_file: focusFile });
   }
 
   els.form.addEventListener("submit", (e) => {
     e.preventDefault();
+    if (busy) { if (controller) controller.abort(); return; } // הכפתור משמש כ"עצור"
     const text = els.input.value.trim();
     if (!text) return;
     els.input.value = "";
     autoGrow();
-    ask({ message: text });
+    sendMessage(text);
   });
 
   // Enter שולח, Shift+Enter יורד שורה
   els.input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
-      els.form.requestSubmit();
+      if (!busy) els.form.requestSubmit();
     }
   });
 
@@ -174,23 +338,139 @@
   }
   els.input.addEventListener("input", autoGrow);
 
-  document.querySelectorAll("[data-analysis]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      addMessage("user", btn.textContent.trim());
-      ask({ analysis: btn.dataset.analysis });
+  els.messages.addEventListener("click", (e) => {
+    const ex = e.target.closest(".example");
+    if (ex && !busy) sendMessage(ex.textContent.trim());
+  });
+
+  // ======================================================================
+  // דוחות מהירים (SQL, 0 טוקנים) ואנליזת LLM
+  // ======================================================================
+  const mdCell = (v) => String(v ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
+
+  /** ממיר דוח {title, columns, rows} לטבלת Markdown - כך העתקה וייצוא ל-Word עובדים גם עליו. */
+  function reportToMarkdown(r) {
+    let md = `### ${r.title}\n\n`;
+    if (r.rows && r.rows.length) {
+      md += `| ${r.columns.map(mdCell).join(" | ")} |\n| ${r.columns.map(() => "---").join(" | ")} |\n`;
+      md += r.rows.map((row) => `| ${row.map(mdCell).join(" | ")} |`).join("\n");
+    }
+    if (r.note) md += `\n\n${r.note}`;
+    return md;
+  }
+
+  document.querySelectorAll("[data-report]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (busy) return;
+      addUserMessage(btn.textContent.trim());
+      const bubble = addBotMessage();
+      setBusy(true);
+      try {
+        const report = await api(`/api/reports/${btn.dataset.report}`);
+        setBotBody(bubble, reportToMarkdown(report));
+        finishBotMessage(bubble, { note: "0 טוקנים · ישירות ממסד הנתונים" });
+      } catch (err) {
+        bubble.classList.add("msg-error");
+        bubble.querySelector(".msg-status").innerHTML = `<span class="status-text">שגיאה: ${escapeHtml(err.message)}</span>`;
+      } finally {
+        setBusy(false);
+      }
     });
   });
 
-  els.messages.addEventListener("click", (e) => {
-    const ex = e.target.closest(".example");
-    if (ex) ask({ message: ex.textContent.trim() });
+  document.querySelectorAll("[data-analysis]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (busy) return;
+      addUserMessage(btn.textContent.trim());
+      streamChat({ analysis: btn.dataset.analysis });
+    });
   });
 
+  // ======================================================================
+  // פעולות על תשובה: העתקה, טבלה לאקסל, ייצוא ל-Word
+  // ======================================================================
+  els.messages.addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-msg-action]");
+    if (!btn) return;
+    const bubble = btn.closest(".msg-bot");
+    const md = rawMarkdown.get(bubble) || "";
+    const action = btn.dataset.msgAction;
+    try {
+      if (action === "copy") {
+        await navigator.clipboard.writeText(md);
+        toast("התשובה הועתקה");
+      } else if (action === "table") {
+        const table = bubble.querySelector(".msg-body table");
+        const tsv = [...table.rows].map((r) => [...r.cells].map((c) => c.innerText.replace(/\s+/g, " ").trim()).join("\t")).join("\n");
+        await navigator.clipboard.writeText(tsv);
+        toast("הטבלה הועתקה - אפשר להדביק באקסל");
+      } else if (action === "word") {
+        btn.disabled = true;
+        const title = (md.match(/^#+\s+(.+)$/m) || [])[1] || "תשובת סוכן החוזים";
+        const doc = await api("/api/docs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ markdown: md, title: title.slice(0, 200) }),
+        });
+        const a = document.createElement("a");
+        a.href = doc.download_url;
+        a.download = doc.file_name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        toast(doc.drive_link ? "המסמך הורד וגובה לדרייב" : "המסמך הורד");
+      }
+    } catch (err) {
+      toast(err.message || "הפעולה נכשלה", 6000);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // ======================================================================
+  // מיקוד בחוזה
+  // ======================================================================
+  function setFocus(name) {
+    focusFile = name || null;
+    els.focusBar.hidden = !focusFile;
+    els.focusBar.innerHTML = focusFile
+      ? `<span class="focus-chip">📎 שאלות על: <b>${escapeHtml(focusFile)}</b>
+           <button type="button" class="focus-clear" aria-label="ביטול מיקוד">✕</button></span>`
+      : "";
+    if (focusFile) els.input.focus();
+  }
+  els.focusBar.addEventListener("click", (e) => { if (e.target.closest(".focus-clear")) setFocus(null); });
+
+  // ======================================================================
+  // שיחה חדשה ושחזור שיחה
+  // ======================================================================
   els.newChatBtn.addEventListener("click", () => {
+    if (controller) controller.abort();
     sessionId = newSessionId();
-    els.messages.innerHTML = '<div class="empty-state"><h3>שיחה חדשה</h3><p>ההיסטוריה הקודמת לא תישלח למודל.</p></div>';
+    setFocus(null);
+    showEmptyState();
     toast("נפתחה שיחה חדשה");
   });
+
+  /** משחזר את הודעות השיחה מהשרת אחרי רענון הדף (קריאה מ-Postgres, ללא LLM). */
+  async function restoreSession() {
+    try {
+      const { messages } = await api(`/api/sessions/${encodeURIComponent(sessionId)}/messages`);
+      if (!messages || !messages.length) { showEmptyState(); return; }
+      els.messages.innerHTML = "";
+      for (const m of messages) {
+        if (m.role === "user") addUserMessage(m.content, m.focus);
+        else {
+          const b = addBotMessage();
+          setBotBody(b, m.content);
+          finishBotMessage(b, {});
+        }
+      }
+      els.messages.scrollTop = els.messages.scrollHeight;
+    } catch (_) {
+      showEmptyState();
+    }
+  }
 
   // ======================================================================
   // קבצים
@@ -200,6 +480,7 @@
     try {
       const data = await api("/api/files");
       files = data.files || [];
+      maxRetries = data.max_retries || maxRetries;
       renderFiles();
       renderSyncInfo(data.last_sync);
       const inProgress = files.some((f) => f.status === "processing");
@@ -208,6 +489,11 @@
     } catch (err) {
       els.fileList.innerHTML = `<li class="muted small">${escapeHtml(err.message)}</li>`;
     }
+  }
+
+  function statusLabel(f) {
+    if (f.status === "error" && f.retries >= maxRetries) return "נכשל - דורש בדיקה";
+    return STATUS_LABELS[f.status] || f.status;
   }
 
   /** מציג את רשימת הקבצים (כולל סינון לפי טקסט חופשי). */
@@ -222,16 +508,19 @@
     els.fileList.innerHTML = visible.map((f) => {
       const m = f.metadata || {};
       const metaParts = [m.block_parcel || m.property, m.end_date ? `עד ${m.end_date}` : "", formatSize(f.size)].filter(Boolean);
-      const title = f.status === "error" && f.error ? ` title="${escapeHtml(f.error)}"` : "";
+      // שגיאה מוצגת בטקסט גלוי (ולא רק ב-tooltip) - כדי שתהיה נגישה גם בנייד
+      const meta = f.status === "error" && f.error
+        ? `<div class="file-meta file-error">${escapeHtml(f.error)}</div>`
+        : `<div class="file-meta">${escapeHtml(metaParts.join(" · ") || (f.extraction ? `פוענח: ${f.extraction}` : ""))}</div>`;
       return `
         <li class="file-item" data-id="${escapeHtml(f.id)}">
-          <a class="file-name" href="${escapeHtml(f.link || "#")}" target="_blank" rel="noopener" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</a>
+          <button class="file-name" data-action="details" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</button>
           <div class="file-actions">
-            <span class="status status-${escapeHtml(f.status)}"${title}>${STATUS_LABELS[f.status] || escapeHtml(f.status)}</span>
-            <button class="icon-btn" data-action="ask" title="שאל על החוזה">💬</button>
+            <span class="status status-${escapeHtml(f.status)}">${escapeHtml(statusLabel(f))}</span>
+            <button class="icon-btn" data-action="focus" title="שאל על החוזה הזה">📎</button>
             <button class="icon-btn danger" data-action="delete" title="מחיקה">🗑</button>
           </div>
-          <div class="file-meta">${escapeHtml(metaParts.join(" · ") || (f.extraction ? `פוענח: ${f.extraction}` : ""))}</div>
+          ${meta}
         </li>`;
     }).join("");
   }
@@ -240,52 +529,121 @@
     if (!last) { els.syncInfo.textContent = ""; return; }
     if (last.status === "error") { els.syncInfo.textContent = `סנכרון אחרון נכשל: ${last.message || ""}`; return; }
     const when = last.finished_at ? new Date(last.finished_at).toLocaleString("he-IL") : "";
-    els.syncInfo.textContent = `סנכרון אחרון ${when}: ${last.new} חדשים, ${last.updated} עודכנו, ${last.skipped} ללא שינוי, ${last.removed} הוסרו${last.failed ? `, ${last.failed} נכשלו` : ""}`;
+    els.syncInfo.textContent = `סנכרון אחרון ${when}: ${last.new} חדשים, ${last.updated} עודכנו, ${last.skipped} ללא שינוי, ${last.removed} הוסרו` +
+      `${last.failed ? `, ${last.failed} נכשלו` : ""}${last.gave_up ? `, ${last.gave_up} דורשים בדיקה` : ""}`;
   }
 
   els.fileSearch.addEventListener("input", renderFiles);
 
+  async function deleteFile(file) {
+    if (!confirm(`להעביר את "${file.name}" לאשפה בדרייב ולהסיר מהאינדקס?`)) return false;
+    try {
+      await api(`/api/files/${encodeURIComponent(file.id)}`, { method: "DELETE" });
+      toast("הקובץ הועבר לאשפה");
+      if (focusFile === file.name) setFocus(null);
+      loadFiles();
+      return true;
+    } catch (err) {
+      toast(err.message, 6000);
+      return false;
+    }
+  }
+
   els.fileList.addEventListener("click", async (e) => {
-    const btn = e.target.closest("button[data-action]");
+    const btn = e.target.closest("[data-action]");
     if (!btn) return;
     const item = btn.closest(".file-item");
     const file = files.find((f) => f.id === item.dataset.id);
     if (!file) return;
-
-    if (btn.dataset.action === "ask") {
-      els.input.value = `סכם בקצרה את החוזה "${file.name}": צדדים, נכס, תוקף ותנאים כספיים.`;
-      els.input.focus();
-      autoGrow();
-    }
-
+    if (btn.dataset.action === "details") openFileDialog(file);
+    if (btn.dataset.action === "focus") setFocus(file.name);
     if (btn.dataset.action === "delete") {
-      if (!confirm(`להעביר את "${file.name}" לאשפה בדרייב ולהסיר מהאינדקס?`)) return;
       btn.disabled = true;
-      try {
-        await api(`/api/files/${encodeURIComponent(file.id)}`, { method: "DELETE" });
-        toast("הקובץ הועבר לאשפה");
-        loadFiles();
-      } catch (err) {
-        toast(err.message, 6000);
-        btn.disabled = false;
-      }
+      if (!(await deleteFile(file))) btn.disabled = false;
     }
   });
 
-  /** מעלה קבצים אחד אחרי השני (לא במקביל - חוסך זיכרון בשרת). */
-  async function uploadFiles(list) {
-    for (const file of list) {
+  // ---------- כרטיס חוזה (מטא-דאטה מקומי, 0 טוקנים) ----------
+  let dialogFile = null;
+
+  function openFileDialog(file) {
+    dialogFile = file;
+    const m = file.metadata || {};
+    $("#fdTitle").textContent = file.name;
+    const rows = META_LABELS
+      .map(([k, label]) => [label, Array.isArray(m[k]) ? m[k].join("; ") : m[k]])
+      .filter(([, v]) => v);
+    rows.push(["סטטוס", statusLabel(file)]);
+    if (file.extraction) rows.push(["פענוח", `${file.extraction}${file.pages ? ` · ${file.pages} עמ'` : ""}`]);
+    if (file.error) rows.push(["שגיאה", file.error]);
+    $("#fdMeta").innerHTML = rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join("")
+      || `<dd class="muted">אין מטא-דאטה - הקובץ עוד לא אונדקס.</dd>`;
+    const link = $("#fdLink");
+    link.hidden = !file.link;
+    link.href = file.link || "#";
+    $("#fdReindex").hidden = !["error", "pending", "outdated"].includes(file.status);
+    els.dialog.showModal();
+  }
+
+  $("#fdFocus").addEventListener("click", () => {
+    setFocus(dialogFile.name);
+    els.dialog.close();
+  });
+  $("#fdDelete").addEventListener("click", async () => {
+    if (await deleteFile(dialogFile)) els.dialog.close();
+  });
+  $("#fdReindex").addEventListener("click", async () => {
+    try {
+      await api(`/api/files/${encodeURIComponent(dialogFile.id)}/reindex`, { method: "POST" });
+      toast("האינדוקס התחיל ברקע");
+      els.dialog.close();
+      loadFiles();
+    } catch (err) {
+      toast(err.message, 6000);
+    }
+  });
+
+  // ---------- העלאה עם סרגל התקדמות ----------
+  /** מעלה קובץ בודד ב-XHR (ל-fetch אין אירועי התקדמות להעלאה). */
+  function uploadOne(file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
       const fd = new FormData();
       fd.append("file", file);
-      toast(`מעלה את ${file.name}…`, 60000);
+      xhr.open("POST", "/api/files/upload");
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+      xhr.onload = () => {
+        let data = null;
+        try { data = JSON.parse(xhr.responseText); } catch (_) {}
+        if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+        else reject(new Error(errorDetail(data, xhr.status)));
+      };
+      xhr.onerror = () => reject(new Error("שגיאת רשת בהעלאה"));
+      xhr.send(fd);
+    });
+  }
+
+  /** מעלה קבצים אחד אחרי השני (לא במקביל - חוסך זיכרון בשרת). */
+  async function uploadFiles(list) {
+    const bar = els.uploadProgress.querySelector("i");
+    const label = els.uploadProgress.querySelector("span");
+    els.uploadProgress.hidden = false;
+    for (let i = 0; i < list.length; i++) {
+      const file = list[i];
+      const prefix = list.length > 1 ? `(${i + 1}/${list.length}) ` : "";
       try {
-        await api("/api/files/upload", { method: "POST", body: fd });
+        await uploadOne(file, (p) => {
+          bar.style.width = `${Math.round(p * 100)}%`;
+          label.textContent = p < 1 ? `${prefix}מעלה את ${file.name}… ${Math.round(p * 100)}%` : `${prefix}שומר בדרייב…`;
+        });
         toast(`${file.name} הועלה - מתבצע אינדוקס ברקע`);
       } catch (err) {
         toast(`${file.name}: ${err.message}`, 6000);
       }
+      bar.style.width = "0";
       await loadFiles();
     }
+    els.uploadProgress.hidden = true;
   }
 
   els.fileInput.addEventListener("change", () => {
@@ -347,5 +705,6 @@
 
   // ---------- אתחול ----------
   if (window.marked) marked.setOptions({ breaks: true, gfm: true });
+  restoreSession();
   loadFiles();
 })();

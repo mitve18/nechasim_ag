@@ -68,13 +68,14 @@ class Settings(BaseSettings):
 
     # --- כיול צריכת טוקנים ---
     RAG_LIMIT: int = 5  # מקסימום מקטעים שחוזרים מכל חיפוש - שולט ישירות בגודל הקונטקסט
-    HISTORY_RUNS: int = 4  # כמה סבבי שיחה קודמים נכנסים לקונטקסט של הסוכן
+    HISTORY_RUNS: int = 2  # כמה סבבי שיחה קודמים נכנסים במלואם; מה שקדם להם מגיע כסיכום מתגלגל
     MIN_CHARS_PER_PAGE: int = 50  # מתחת לסף הזה בממוצע לעמוד -> הקובץ נחשב סרוק ונשלח ל-OCR
     OCR_DPI: int = 150  # רזולוציית המרת עמוד לתמונה עבור Vision
     METADATA_SAMPLE_CHARS: int = 6000  # כמה תווים מתחילת חוזה דיגיטלי נשלחים לחילוץ מטא-דאטה
-    MAX_CHUNK_CHARS: int = 2500  # גודל מקסימלי למקטע; סעיף ארוך יותר יפוצל
+    MAX_CHUNK_CHARS: int = 1500  # גודל מקסימלי למקטע; סעיף ארוך יותר יפוצל (5 מקטעים ≈ תקרת הכלי)
     CHUNK_OVERLAP: int = 200  # חפיפה בין תת-מקטעים של סעיף ארוך כדי לא לאבד הקשר
     TOOL_RESULT_MAX_CHARS: int = 6000  # תקרת אורך לפלט של כל כלי - מונע "הצפת" הקונטקסט
+    MAX_INDEX_RETRIES: int = 3  # אחרי כמה כשלונות על אותה גרסת קובץ הסנכרון הלילי מפסיק לנסות (חוסך OCR)
 
     # --- טבלאות ב-Postgres ---
     VECTOR_TABLE: str = "contract_chunks"
@@ -86,6 +87,7 @@ class Settings(BaseSettings):
     TMP_DIR: str = "/tmp" if os.name != "nt" else tempfile.gettempdir()
     GENERATED_DOCS_DIR: str = str(BASE_DIR / "generated_docs")
     PUBLIC_DIR: str = str(BASE_DIR / "public")
+    TEMPLATES_DIR: str = str(BASE_DIR / "templates")  # תבניות Word מוסדיות (base.docx / <doc_type>.docx)
     GENERATED_DRIVE_SUBFOLDER: str = "generated"  # תת-תיקייה בדרייב לגיבוי מסמכי Word שנוצרו
 
     @field_validator("SUPABASE_DB_URL")

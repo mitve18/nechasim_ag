@@ -43,6 +43,10 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 # גודל Chunk להעלאה/הורדה: 5MB (חייב להיות כפולה של 256KB לפי דרישות Google)
 CHUNK_SIZE = 5 * 1024 * 1024
 
+# ניסיונות חוזרים אוטומטיים (עם Backoff אקספוננציאלי של ספריית Google) לשגיאות
+# זמניות בלבד: 429, 5xx ושגיאות רשת. שגיאות הרשאה (403/404) לא נשלחות שוב.
+NUM_RETRIES = 3
+
 # השדות היחידים שאנחנו מבקשים מה-API - פחות נתונים ברשת ובזיכרון
 FILE_FIELDS = "id, name, mimeType, md5Checksum, modifiedTime, size, webViewLink"
 
@@ -117,7 +121,7 @@ class DriveService:
                         corpora="allDrives",
                         orderBy="modifiedTime desc",
                     )
-                    .execute()
+                    .execute(num_retries=NUM_RETRIES)
                 )
                 for f in resp.get("files", []):
                     if only_supported and f.get("mimeType") not in SUPPORTED_MIME_TYPES:
@@ -138,7 +142,7 @@ class DriveService:
             f = (
                 self._service.files()
                 .get(fileId=file_id, fields=FILE_FIELDS, supportsAllDrives=True)
-                .execute()
+                .execute(num_retries=NUM_RETRIES)
             )
             f["fingerprint"] = f.get("md5Checksum") or f"mtime:{f.get('modifiedTime')}"
             return f
@@ -167,7 +171,7 @@ class DriveService:
             )
             response = None
             while response is None:
-                status, response = request.next_chunk()
+                status, response = request.next_chunk(num_retries=NUM_RETRIES)
                 if status:
                     logger.info("העלאה %s: %d%%", name, int(status.progress() * 100))
         except HttpError as e:
@@ -204,14 +208,14 @@ class DriveService:
         resp = self._service.files().list(
             q=q, fields="files(id)", supportsAllDrives=True,
             includeItemsFromAllDrives=True, corpora="allDrives",
-        ).execute()
+        ).execute(num_retries=NUM_RETRIES)
         if resp.get("files"):
             self._generated_folder_id = resp["files"][0]["id"]
         else:
             folder = self._service.files().create(
                 body={"name": name, "mimeType": FOLDER_MIME, "parents": [self.folder_id]},
                 fields="id", supportsAllDrives=True,
-            ).execute()
+            ).execute(num_retries=NUM_RETRIES)
             self._generated_folder_id = folder["id"]
         return self._generated_folder_id
 
@@ -242,7 +246,7 @@ class DriveService:
                 downloader = MediaIoBaseDownload(fh, request, chunksize=CHUNK_SIZE)
                 done = False
                 while not done:
-                    _, done = downloader.next_chunk()
+                    _, done = downloader.next_chunk(num_retries=NUM_RETRIES)
         except HttpError as e:
             if os.path.exists(local_path):
                 os.remove(local_path)
@@ -262,7 +266,7 @@ class DriveService:
         try:
             self._service.files().update(
                 fileId=file_id, body={"trashed": True}, supportsAllDrives=True
-            ).execute()
+            ).execute(num_retries=NUM_RETRIES)
         except HttpError as e:
             raise self._friendly_error(e, "מחיקת הקובץ") from e
 
