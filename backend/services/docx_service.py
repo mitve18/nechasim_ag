@@ -104,7 +104,10 @@ class DocxService:
         for name in (f"{doc_type}.docx", "base.docx"):
             p = self.templates_dir / name
             if p.is_file():
-                return DocxDocument(str(p)), True
+                try:
+                    return DocxDocument(str(p)), True
+                except Exception as e:  # noqa: BLE001 - תבנית נעולה/פגומה לא מונעת הפקת מסמך
+                    logger.warning("לא ניתן לפתוח את התבנית %s: %s", p.name, e)
         return DocxDocument(), False
 
     # ------------------------------------------------------------------

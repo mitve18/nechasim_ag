@@ -71,7 +71,12 @@ class Settings(BaseSettings):
     HISTORY_RUNS: int = 2  # כמה סבבי שיחה קודמים נכנסים במלואם; מה שקדם להם מגיע כסיכום מתגלגל
     MIN_CHARS_PER_PAGE: int = 50  # מתחת לסף הזה בממוצע לעמוד -> הקובץ נחשב סרוק ונשלח ל-OCR
     OCR_DPI: int = 150  # רזולוציית המרת עמוד לתמונה עבור Vision
-    METADATA_SAMPLE_CHARS: int = 6000  # כמה תווים מתחילת חוזה דיגיטלי נשלחים לחילוץ מטא-דאטה
+    METADATA_SAMPLE_CHARS: int = 6000  # תקרת תווים מעמודי המפתח שנשלחים לחילוץ מטא-דאטה (70% התחלה, 30% סוף)
+    METADATA_KEY_PAGES: int = 3  # עמודי מפתח: 3 ראשונים + 3 אחרונים - רק הם נשלחים למטא-דאטה, בכל אורך חוזה
+    METADATA_MAX_OUTPUT_TOKENS: int = 1000  # תקרת פלט לחילוץ מטא-דאטה
+    OCR_MAX_OUTPUT_TOKENS: int = 8000  # תקרת פלט לעמוד OCR; חריגה -> העמוד מפוצל לרצועות
+    OCR_MAX_SPLIT_DEPTH: int = 2  # כמה פעמים מותר לפצל עמוד צפוף (2 = עד 4 רצועות)
+    EMBED_BATCH_SIZE: int = 50  # מקטעים לכל מנת Embedding+הכנסה ל-PgVector
     MAX_CHUNK_CHARS: int = 1500  # גודל מקסימלי למקטע; סעיף ארוך יותר יפוצל (5 מקטעים ≈ תקרת הכלי)
     CHUNK_OVERLAP: int = 200  # חפיפה בין תת-מקטעים של סעיף ארוך כדי לא לאבד הקשר
     TOOL_RESULT_MAX_CHARS: int = 6000  # תקרת אורך לפלט של כל כלי - מונע "הצפת" הקונטקסט

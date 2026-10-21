@@ -22,6 +22,12 @@ rag_service.py - לב מערכת ה-RAG: טבלת מעקב, פיענוח/OCR, ח
     - מטא-דאטה מובנה בטבלת המעקב מאפשר לענות על שאלות כמו "אילו חוזים מסתיימים
       החודש" בשאילתת SQL - בלי LLM ובלי RAG בכלל.
 
+חוזים ארוכים מאוד (ללא הגבלת עמודים):
+    - כל קריאת LLM חסומה בגודל: OCR עמוד-עמוד עם תקרת פלט (עמוד צפוף מפוצל לרצועות),
+      ומטא-דאטה רק מעמודי המפתח (התחלה וסוף) - גודל הבקשה לא תלוי באורך החוזה.
+    - עמוד בעייתי מסומן כ"לא פוענח" והחוזה ממשיך; קובץ שנכשל לא עוצר את הסנכרון.
+    - המקטעים מוגבלים בגודל ונכנסים ל-PgVector במנות קטנות.
+
 ניהול זיכרון ב-Render:
     - עיבוד קובץ אחד בכל פעם, ובתוך הקובץ עמוד אחד בכל פעם (Pixmap משוחרר מיד).
     - הקבצים הזמניים נמחקים ב-finally ו-gc.collect() נקרא אחרי כל קובץ.
@@ -40,7 +46,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import fitz  # PyMuPDF
-from openai import OpenAI
+import openai
+from openai import ContentFilterFinishReasonError, LengthFinishReasonError, OpenAI
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     Column, DateTime, Integer, MetaData, String, Table, Text, case, create_engine, delete, select, text,
@@ -86,12 +93,29 @@ OCR_SYSTEM_PROMPT = (
     "אתה מומחה OCR לחוזים משפטיים בעברית. תמלל את העמוד במדויק ל-Markdown. "
     "כל סעיף ממוספר מתחיל בשורה '## סעיף X' (X = מספר הסעיף כפי שמופיע). "
     "תת-סעיפים כרשימה. טבלאות כטבלת Markdown. אל תמציא טקסט ואל תסכם. "
-    "במטא-דאטה מלא רק מה שמופיע בעמוד הזה; תאריכים בפורמט YYYY-MM-DD."
+    "במטא-דאטה מלא רק מה שמופיע בעמוד הזה, בקצרה (financial_terms עד 300 תווים); "
+    "תאריכים בפורמט YYYY-MM-DD."
 )
 
 METADATA_SYSTEM_PROMPT = (
-    "חלץ מטא-דאטה מחוזה בעברית. מלא רק מידע שמופיע במפורש בטקסט. תאריכים בפורמט YYYY-MM-DD."
+    "חלץ מטא-דאטה מחוזה בעברית. מלא רק מידע שמופיע במפורש בטקסט. תאריכים בפורמט YYYY-MM-DD. "
+    "financial_terms - סיכום קצר עד 400 תווים."
 )
+
+# שגיאות OpenAI שאחריהן מכשילים את הקובץ כולו (והוא ינוסה שוב בסנכרון הבא) במקום
+# לאנדקס אותו עם "חורים": עומס/ניתוק שנמשכו גם אחרי הניסיונות החוזרים של ה-SDK,
+# או בעיית הרשאה/מכסה שתשפיע על כל העמודים.
+_FATAL_OPENAI_ERRORS = (
+    openai.RateLimitError, openai.APIConnectionError, openai.APITimeoutError,
+    openai.InternalServerError, openai.AuthenticationError, openai.PermissionDeniedError,
+)
+
+# תקרות מטא-דאטה: בחוזה של מאות עמודים כל עמוד מוסיף צדדים/תנאים, ובלי תקרה
+# שורת ההקשר (שנכנסת לכל מקטע ול-Embedding שלו) הייתה גדלה ללא הגבלה
+_MAX_PARTIES = 8
+_MAX_FINANCIAL_CHARS = 1500
+_MAX_HEADER_CHARS = 400
+_MAX_SECTION_TITLE = 80
 
 # זיהוי כותרת סעיף בטקסט דיגיטלי: "סעיף 5", "5.", "5)" בתחילת שורה
 _DIGITAL_SECTION_RE = re.compile(r"^\s*(?:סעיף\s+)?(\d{1,3})\s*[.)]\s+(?=\S)|^\s*סעיף\s+(\d{1,3})\b")
@@ -215,15 +239,23 @@ class RagService:
                     summary["gave_up"] += 1
                     continue
                 try:
-                    self.index_file(f)
+                    result = self.index_file(f)
                     summary["updated" if row else "new"] += 1
-                except Exception as e:  # noqa: BLE001 - כשל בקובץ אחד לא עוצר את הסנכרון
+                    if result.get("failed_pages"):
+                        summary["errors"].append(f"{f.get('name')}: {len(result['failed_pages'])} עמודים לא פוענחו")
+                except Exception as e:  # noqa: BLE001 - כשל בקובץ אחד (גם כבד במיוחד) לא עוצר את הסנכרון
                     summary["failed"] += 1
-                    summary["errors"].append(f"{f.get('name')}: {str(e)[:200]}")
+                    summary["errors"].append(f"{f.get('name')}: {type(e).__name__}: {str(e)[:200]}")
+                finally:
+                    gc.collect()  # קובץ ענק לא משאיר זיכרון תפוס לקובץ הבא
 
             for file_id in set(rows) - drive_ids:
-                self.remove_file(file_id)
-                summary["removed"] += 1
+                try:
+                    self.remove_file(file_id)
+                    summary["removed"] += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("הסרת קובץ %s מהאינדקס נכשלה", file_id)
+                    summary["errors"].append(f"הסרה {file_id}: {str(e)[:200]}")
             logger.info("Delta Sync הסתיים: %s", summary)
             return summary
         finally:
@@ -246,17 +278,31 @@ class RagService:
             meta = result["metadata"]
             chunks = self.chunk_by_sections(result["markdown"], meta, file)
 
-            self.vector_db.delete_by_metadata({"file_id": file["id"]})
-            if chunks:
-                self.vector_db.insert(content_hash=f"{file['id']}:{file['fingerprint']}", documents=chunks)
+            if not chunks:
+                raise ValueError("לא חולץ טקסט מהקובץ (ייתכן שהוא ריק, מוצפן או פגום)")
+            result["markdown"] = None  # הטקסט המלא כבר בתוך המקטעים - משחררים זיכרון
 
+            # מחיקת הגרסה הקודמת רק אחרי שהפיענוח הצליח - כשל בפיענוח לא מוחק אינדקס קיים
+            self.vector_db.delete_by_metadata({"file_id": file["id"]})
+            # Embeddings + הכנסה במנות קטנות: חוזה של אלפי מקטעים לא נשלח כבקשה אחת
+            batch = self.settings.EMBED_BATCH_SIZE
+            for i in range(0, len(chunks), batch):
+                self.vector_db.insert(content_hash=f"{file['id']}:{file['fingerprint']}",
+                                      documents=chunks[i: i + batch], batch_size=batch)
+
+            failed = result["failed_pages"]
+            note = f"{len(failed)} עמודים לא פוענחו: {', '.join(map(str, failed[:30]))}" if failed else None
             self._upsert_tracking(file, status="indexed", metadata=meta, chunks=len(chunks),
                                   pages=result["pages"], ocr_pages=result["ocr_pages"],
-                                  extraction=result["extraction"], error=None)
-            return {"file": file["name"], "chunks": len(chunks), "extraction": result["extraction"]}
+                                  extraction=result["extraction"], error=note)
+            return {"file": file["name"], "chunks": len(chunks), "extraction": result["extraction"],
+                    "failed_pages": failed}
         except Exception as e:
             logger.exception("אינדוקס הקובץ %s נכשל", file.get("name"))
-            self._upsert_tracking(file, status="error", error=str(e)[:1000])
+            try:
+                self._upsert_tracking(file, status="error", error=f"{type(e).__name__}: {e}"[:1000])
+            except Exception:  # noqa: BLE001 - כשל ברישום לא מסתיר את השגיאה המקורית
+                logger.exception("עדכון טבלת המעקב נכשל עבור %s", file.get("name"))
             raise
         finally:
             # ניקוי זיכרון ודיסק: קריטי ב-Render, שם /tmp והזיכרון מוגבלים
@@ -321,27 +367,49 @@ class RagService:
         merged = ContractMetadata()
         ocr_pages = 0
         digital_pages = 0
+        failed_pages: List[int] = []
+        # טקסט עמודי המפתח (התחלה וסוף) - רק הם נשלחים לחילוץ מטא-דאטה, בכל אורך מסמך
+        head_pages: List[str] = []
+        tail_pages: List[str] = []
+        key = self.settings.METADATA_KEY_PAGES
 
         with fitz.open(path) as doc:
             page_count = doc.page_count
             for i in range(page_count):
-                page = doc.load_page(i)
-                page_text = page.get_text("text") if doc.is_pdf else ""
-                if len(page_text.strip()) >= self.settings.MIN_CHARS_PER_PAGE:
-                    parts.append(self._digital_text_to_markdown(page_text))
-                    digital_pages += 1
-                else:
-                    page_result = self._ocr_page(page, i + 1, page_count)
-                    parts.append(page_result.markdown)
-                    self._merge_metadata(merged, page_result.metadata)
-                    ocr_pages += 1
-                del page  # שחרור משאבי העמוד מיד
+                page_no = i + 1
+                try:
+                    page = doc.load_page(i)
+                    page_text = page.get_text("text") if doc.is_pdf else ""
+                    if len(page_text.strip()) >= self.settings.MIN_CHARS_PER_PAGE:
+                        md = self._digital_text_to_markdown(page_text)
+                        digital_pages += 1
+                    else:
+                        page_result = self._ocr_page(page, page_no, page_count)
+                        md = page_result.markdown
+                        self._merge_metadata(merged, page_result.metadata)
+                        ocr_pages += 1
+                    del page  # שחרור משאבי העמוד מיד
+                except _FATAL_OPENAI_ERRORS:
+                    raise  # בעיה כללית (עומס/הרשאה) - הקובץ כולו ינוסה שוב בסנכרון הבא
+                except Exception as e:  # noqa: BLE001 - עמוד בעייתי אחד לא מפיל חוזה של מאות עמודים
+                    logger.warning("עמוד %s/%s לא פוענח: %s", page_no, page_count, e)
+                    failed_pages.append(page_no)
+                    md = f"[עמוד {page_no}: לא ניתן היה לפענח את העמוד]"
+                parts.append(md)
+                if i < key:
+                    head_pages.append(md)
+                elif i >= page_count - key:
+                    tail_pages.append(md)
+
+        if failed_pages and len(failed_pages) == page_count:
+            raise RuntimeError(f"אף עמוד לא פוענח ({page_count} עמודים)")
 
         markdown = "\n\n".join(p for p in parts if p.strip())
+        del parts
 
-        # בעמודים דיגיטליים לא התקבל מטא-דאטה מה-OCR, לכן קריאה אחת זולה על תחילת המסמך
+        # בעמודים דיגיטליים לא התקבל מטא-דאטה מה-OCR, לכן קריאה אחת זולה על עמודי המפתח בלבד
         if digital_pages:
-            self._merge_metadata(merged, self._extract_metadata_from_text(markdown))
+            self._merge_metadata(merged, self._extract_metadata_from_text(head_pages, tail_pages))
 
         extraction = "ocr" if not digital_pages else ("digital" if not ocr_pages else "mixed")
         return {
@@ -350,65 +418,102 @@ class RagService:
             "pages": page_count,
             "ocr_pages": ocr_pages,
             "extraction": extraction,
+            "failed_pages": failed_pages,
         }
 
-    def _ocr_page(self, page: "fitz.Page", page_no: int, total: int) -> PageExtraction:
+    def _ocr_page(self, page: "fitz.Page", page_no: int, total: int,
+                  clip: Optional["fitz.Rect"] = None, depth: int = 0) -> PageExtraction:
         """
-        ממיר עמוד לתמונת PNG ב-150 DPI ושולח ל-Vision עם Structured Outputs.
+        ממיר עמוד (או רצועה ממנו) לתמונת PNG ושולח ל-Vision עם Structured Outputs.
 
-        - 150 DPI: מספיק לקריאת עברית מודפסת, וקטן משמעותית מ-300 DPI (פחות
-          "אריחים" של Vision = פחות טוקנים, ופחות זיכרון).
+        - 150 DPI: מספיק לקריאת עברית מודפסת, וקטן משמעותית מ-300 DPI.
+        - max_tokens=OCR_MAX_OUTPUT_TOKENS: תקרה לכל קריאה. בלי תקרה, עמוד שבו המודל
+          "נתקע בלולאה" (חוזר על שורות בטבלה) שורף ~16K טוקני פלט ונכשל בכל מקרה.
+        - עמוד צפוף שחורג מהתקרה (LengthFinishReasonError - "length limit was reached")
+          מפוצל לחצי עליון ותחתון (עם חפיפה קטנה כדי לא לחתוך שורה), כל חצי מפוענח
+          בנפרד והתוצאות מתאחדות - עד OCR_MAX_SPLIT_DEPTH רמות (עד 4 רצועות).
         - ה-Pixmap וה-Bytes משוחררים מיד אחרי הקידוד ל-Base64.
-        - response_format=PageExtraction מבטיח JSON תקין - בלי ניסיונות חוזרים ובלי
-          טוקנים מבוזבזים על פרסור טקסט חופשי.
         """
-        pix = page.get_pixmap(dpi=self.settings.OCR_DPI)
+        pix = page.get_pixmap(dpi=self.settings.OCR_DPI, clip=clip)
         img_b64 = base64.b64encode(pix.tobytes("png")).decode("ascii")
         del pix
 
-        completion = self.openai.chat.completions.parse(
-            model=self.settings.VISION_MODEL,
-            temperature=0,
-            response_format=PageExtraction,
-            messages=[
-                {"role": "system", "content": OCR_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"עמוד {page_no} מתוך {total}."},
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"}},
-                    ],
-                },
-            ],
-        )
+        part = "" if clip is None else " (רצועה מתוך העמוד - תמלל רק את מה שמופיע בתמונה)"
+        try:
+            completion = self.openai.chat.completions.parse(
+                model=self.settings.VISION_MODEL,
+                temperature=0,
+                max_tokens=self.settings.OCR_MAX_OUTPUT_TOKENS,
+                response_format=PageExtraction,
+                messages=[
+                    {"role": "system", "content": OCR_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"עמוד {page_no} מתוך {total}.{part}"},
+                            {"type": "image_url",
+                             "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"}},
+                        ],
+                    },
+                ],
+            )
+        except LengthFinishReasonError:
+            del img_b64
+            if depth >= self.settings.OCR_MAX_SPLIT_DEPTH:
+                raise ValueError(f"עמוד {page_no} ארוך מדי לפענוח גם אחרי פיצול")
+            logger.info("עמוד %s חרג ממגבלת הפלט - מפצל לרצועות (רמה %s)", page_no, depth + 1)
+            rect = clip or page.rect
+            mid = rect.y0 + rect.height / 2
+            overlap = rect.height * 0.03
+            halves = [fitz.Rect(rect.x0, rect.y0, rect.x1, mid + overlap),
+                      fitz.Rect(rect.x0, mid - overlap, rect.x1, rect.y1)]
+            results = [self._ocr_page(page, page_no, total, clip=h, depth=depth + 1) for h in halves]
+            merged = ContractMetadata()
+            for r in results:
+                self._merge_metadata(merged, r.metadata)
+            return PageExtraction(markdown="\n\n".join(r.markdown for r in results), metadata=merged)
+        except ContentFilterFinishReasonError:
+            raise ValueError(f"עמוד {page_no} נחסם ע\"י מסנן התוכן של OpenAI")
         del img_b64
         parsed = completion.choices[0].message.parsed
         return parsed or PageExtraction(markdown="", metadata=ContractMetadata())
 
-    def _extract_metadata_from_text(self, markdown: str) -> ContractMetadata:
+    def _extract_metadata_from_text(self, head_pages: List[str], tail_pages: List[str]) -> ContractMetadata:
         """
-        מחלץ מטא-דאטה מטקסט דיגיטלי עם מודל זול (gpt-4o-mini).
+        מחלץ מטא-דאטה מעמודי המפתח בלבד, עם מודל זול (gpt-4o-mini).
 
-        נשלחים רק METADATA_SAMPLE_CHARS התווים הראשונים (שם בדרך כלל מופיעים
-        הצדדים, הנכס והתקופה) + 1,500 התווים האחרונים (חתימות ותאריכים).
+        - נשלחים רק METADATA_KEY_PAGES העמודים הראשונים (צדדים, נכס, תקופה) והאחרונים
+          (חתימות, תאריכים, נספח כספי) - לא כל החוזה. גודל הבקשה קבוע, גם לחוזה של
+          אלף עמודים, ולעולם לא חורג ממגבלת ההקשר.
+        - גם בתוך עמודי המפתח יש תקרת תווים (METADATA_SAMPLE_CHARS) למקרה של עמודים צפופים.
+        - max_tokens=METADATA_MAX_OUTPUT_TOKENS; חריגה (LengthFinishReasonError) -> ניסיון
+          נוסף על דגימה קטנה בחצי, ואם גם הוא נכשל - חוזה בלי מטא-דאטה (עדיף על חוזה שלא אונדקס).
         """
         limit = self.settings.METADATA_SAMPLE_CHARS
-        sample = markdown if len(markdown) <= limit + 1500 else markdown[:limit] + "\n...\n" + markdown[-1500:]
-        try:
-            completion = self.openai.chat.completions.parse(
-                model=self.settings.METADATA_MODEL,
-                temperature=0,
-                response_format=ContractMetadata,
-                messages=[
-                    {"role": "system", "content": METADATA_SYSTEM_PROMPT},
-                    {"role": "user", "content": sample},
-                ],
-            )
-            return completion.choices[0].message.parsed or ContractMetadata()
-        except Exception as e:  # noqa: BLE001 - חוזה בלי מטא-דאטה עדיף על חוזה שלא אונדקס
-            logger.warning("חילוץ מטא-דאטה נכשל: %s", e)
-            return ContractMetadata()
+        head = "\n\n".join(head_pages)
+        tail = "\n\n".join(tail_pages)
+        for budget in (limit, limit // 2):
+            sample = head[: int(budget * 0.7)]
+            if tail:
+                sample += "\n...\n" + tail[-int(budget * 0.3):]
+            try:
+                completion = self.openai.chat.completions.parse(
+                    model=self.settings.METADATA_MODEL,
+                    temperature=0,
+                    max_tokens=self.settings.METADATA_MAX_OUTPUT_TOKENS,
+                    response_format=ContractMetadata,
+                    messages=[
+                        {"role": "system", "content": METADATA_SYSTEM_PROMPT},
+                        {"role": "user", "content": sample},
+                    ],
+                )
+                return completion.choices[0].message.parsed or ContractMetadata()
+            except LengthFinishReasonError:
+                logger.warning("חילוץ מטא-דאטה חרג ממגבלת הפלט (דגימה של %s תווים) - מנסה דגימה קטנה יותר", budget)
+            except Exception as e:  # noqa: BLE001 - חוזה בלי מטא-דאטה עדיף על חוזה שלא אונדקס
+                logger.warning("חילוץ מטא-דאטה נכשל: %s", e)
+                break
+        return ContractMetadata()
 
     @staticmethod
     def _merge_metadata(target: ContractMetadata, source: ContractMetadata) -> None:
@@ -419,16 +524,18 @@ class RagService:
         תנאים כספיים משורשרים (הם יכולים להופיע בכמה עמודים).
         """
         for p in source.parties:
-            if p and p not in target.parties:
-                target.parties.append(p)
+            if p and p not in target.parties and len(target.parties) < _MAX_PARTIES:
+                target.parties.append(p[:120])
         for field in ("property", "block_parcel", "start_date", "end_date"):
             if not getattr(target, field) and getattr(source, field):
                 setattr(target, field, getattr(source, field))
         if source.financial_terms:
             if not target.financial_terms:
                 target.financial_terms = source.financial_terms
-            elif source.financial_terms not in target.financial_terms:
+            elif (source.financial_terms not in target.financial_terms
+                  and len(target.financial_terms) < _MAX_FINANCIAL_CHARS):
                 target.financial_terms += "; " + source.financial_terms
+            target.financial_terms = target.financial_terms[:_MAX_FINANCIAL_CHARS]
 
     @staticmethod
     def _digital_text_to_markdown(page_text: str) -> str:
@@ -479,11 +586,13 @@ class RagService:
             end = matches[idx + 1].start() if idx + 1 < len(matches) else len(markdown)
             body = markdown[m.start():end].strip()
             if body:
-                sections.append((m.group(1).strip(), body))
+                # כותרת ארוכה (OCR שהדביק פסקה לכותרת) לא תנפח את המטא-דאטה של כל מקטע
+                sections.append((m.group(1).strip()[:_MAX_SECTION_TITLE], body))
 
         docs: List[Document] = []
         max_len = self.settings.MAX_CHUNK_CHARS
-        overlap = self.settings.CHUNK_OVERLAP
+        # חפיפה תמיד קטנה מהמקטע - אחרת הלולאה לא מתקדמת (מקטעים אינסופיים)
+        overlap = min(self.settings.CHUNK_OVERLAP, max_len // 4)
         base_meta = {
             "file_id": file["id"],
             "file_name": file.get("name", ""),
@@ -509,7 +618,9 @@ class RagService:
         parties = "; ".join(meta.get("parties") or []) or "לא צוין"
         prop = " ".join(x for x in (meta.get("property"), meta.get("block_parcel")) if x) or "לא צוין"
         validity = f"{meta.get('start_date') or '?'} עד {meta.get('end_date') or '?'}"
-        return f"[קובץ: {filename} | צדדים: {parties} | נכס: {prop} | תוקף: {validity}]"
+        header = f"[קובץ: {filename} | צדדים: {parties} | נכס: {prop} | תוקף: {validity}"
+        # תקרה קשיחה: השורה נכנסת לכל מקטע ול-Embedding שלו
+        return (header[: _MAX_HEADER_CHARS - 2] + "…" if len(header) > _MAX_HEADER_CHARS - 1 else header) + "]"
 
     # ==================================================================
     # חיפוש ושאילתות
