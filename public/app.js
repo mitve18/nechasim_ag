@@ -728,13 +728,19 @@
   });
 
   // ---------- העלאה עם סרגל התקדמות ----------
-  /** מעלה קובץ בודד ב-XHR (ל-fetch אין אירועי התקדמות להעלאה). */
+  /**
+   * מעלה קובץ בודד ב-XHR (ל-fetch אין אירועי התקדמות להעלאה).
+   * חשוב: לא מגדירים Content-Type ידנית - הדפדפן קובע multipart/form-data עם ה-boundary הנכון.
+   */
   function uploadOne(file, onProgress) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       const fd = new FormData();
-      fd.append("file", file);
+      fd.append("file", file, file.name);
       xhr.open("POST", "/api/files/upload");
+      xhr.timeout = 15 * 60 * 1000; // קבצים סרוקים גדולים ברשת איטית
+      xhr.ontimeout = () => reject(new Error("ההעלאה ארכה זמן רב מדי"));
+      xhr.onabort = () => reject(new Error("ההעלאה בוטלה"));
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable) onProgress(e.loaded / e.total);
       };
@@ -752,32 +758,58 @@
   }
 
   /** מעלה קבצים אחד אחרי השני (לא במקביל - חוסך זיכרון בשרת). */
-  async function uploadFiles(list) {
-    const bar = els.uploadProgress.querySelector("i");
-    const label = els.uploadProgress.querySelector("span");
-    els.uploadProgress.hidden = false;
-    for (let i = 0; i < list.length; i++) {
-      const file = list[i];
-      const prefix = list.length > 1 ? `(${i + 1}/${list.length}) ` : "";
-      try {
-        await uploadOne(file, (p) => {
-          bar.style.width = `${Math.round(p * 100)}%`;
-          label.textContent =
-            p < 1
-              ? `${prefix}מעלה את ${file.name}… ${Math.round(p * 100)}%`
-              : `${prefix}שומר בדרייב…`;
-        });
-        toast(`${file.name} הועלה - מתבצע אינדוקס ברקע`);
-      } catch (err) {
-        toast(`${file.name}: ${err.message}`, 6000);
-      }
-      bar.style.width = "0";
-      await loadFiles();
-    }
-    els.uploadProgress.hidden = true;
+  let uploading = false;
+  const uploadBtnHtml = els.uploadBtn.innerHTML;
+
+  function setUploading(value) {
+    uploading = value;
+    els.uploadBtn.disabled = value;
+    els.uploadBtn.innerHTML = value ? `<i class="icon-loader-circle spin"></i>מעלה…` : uploadBtnHtml;
   }
 
-  els.uploadBtn.addEventListener("click", () => els.fileInput.click());
+  async function uploadFiles(list) {
+    if (uploading) { toast("העלאה כבר מתבצעת - המתן לסיומה"); return; }
+    const bar = els.uploadProgress.querySelector("i");
+    const label = els.uploadProgress.querySelector("span");
+    let ok = 0;
+    const failed = [];
+    setUploading(true);
+    els.uploadProgress.hidden = false;
+    try {
+      for (let i = 0; i < list.length; i++) {
+        const file = list[i];
+        const prefix = list.length > 1 ? `(${i + 1}/${list.length}) ` : "";
+        bar.style.width = "0";
+        label.textContent = `${prefix}מעלה את ${file.name}…`;
+        try {
+          await uploadOne(file, (p) => {
+            bar.style.width = `${Math.round(p * 100)}%`;
+            label.textContent =
+              p < 1
+                ? `${prefix}מעלה את ${file.name}… ${Math.round(p * 100)}%`
+                : `${prefix}שומר בדרייב…`;
+          });
+          ok++;
+          if (list.length === 1) toast(`✓ ${file.name} הועלה - מתבצע אינדוקס ברקע`);
+        } catch (err) {
+          failed.push(file.name);
+          toast(`✕ ${file.name}: ${err.message}`, 8000);
+        }
+        await loadFiles();
+      }
+      if (list.length > 1) {
+        toast(failed.length
+          ? `הועלו ${ok} מתוך ${list.length}. נכשלו: ${failed.join(", ")}`
+          : `✓ כל ${ok} הקבצים הועלו - מתבצע אינדוקס ברקע`, failed.length ? 8000 : 3500);
+      }
+    } finally {
+      bar.style.width = "0";
+      els.uploadProgress.hidden = true;
+      setUploading(false);
+    }
+  }
+
+  els.uploadBtn.addEventListener("click", () => { if (!uploading) els.fileInput.click(); });
   els.fileInput.addEventListener("change", () => {
     if (els.fileInput.files.length) uploadFiles([...els.fileInput.files]);
     els.fileInput.value = "";

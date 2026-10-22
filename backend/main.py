@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -366,20 +367,39 @@ def upload_file(background: BackgroundTasks, file: UploadFile = File(...)) -> Di
     הזמני -> אינדוקס ברקע (הורדה, פיענוח/OCR, Embeddings). התגובה חוזרת מיד,
     והממשק מציג את הקובץ בסטטוס "processing" עד לסיום.
     """
+    name = file.filename or "contract"
     mime = file.content_type or "application/octet-stream"
+    if mime not in SUPPORTED_MIME_TYPES:
+        # דפדפנים שולחים לעיתים application/octet-stream (נפוץ ב-TIFF/WEBP) - מנחשים לפי הסיומת
+        mime = mimetypes.guess_type(name)[0] or mime
     if mime not in SUPPORTED_MIME_TYPES:
         raise HTTPException(400, "סוג קובץ לא נתמך. ניתן להעלות PDF או תמונה (PNG/JPG/TIFF/WEBP).")
 
-    ext = Path(file.filename or "").suffix.lower()
+    os.makedirs(settings.TMP_DIR, exist_ok=True)
+    ext = Path(name).suffix.lower()
     tmp_path = os.path.join(settings.TMP_DIR, f"upload_{uuid.uuid4().hex}{ext}")
     try:
         with open(tmp_path, "wb") as out:
             while chunk := file.file.read(1024 * 1024):  # 1MB בכל פעם - לא טוענים את כל הקובץ ל-RAM
                 out.write(chunk)
-        uploaded = STATE["drive"].upload_file(tmp_path, file.filename or "contract", mime_type=mime)
+        if os.path.getsize(tmp_path) == 0:
+            raise HTTPException(400, "הקובץ ריק.")
+        uploaded = STATE["drive"].upload_file(tmp_path, name, mime_type=mime)
+    except (HTTPException, DriveServiceError):
+        raise
+    except OSError as e:
+        logger.exception("שמירת הקובץ הזמני נכשלה: %s", tmp_path)
+        raise HTTPException(500, f"שמירת הקובץ בשרת נכשלה: {e.strerror or e}") from e
+    except Exception as e:  # noqa: BLE001 - מחזירים הודעה ברורה במקום 500 ריק
+        logger.exception("העלאת %s לדרייב נכשלה", name)
+        raise HTTPException(502, f"העלאת הקובץ לדרייב נכשלה: {str(e)[:300]}") from e
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        file.file.close()
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:  # לא מסתירים את השגיאה המקורית בגלל כשל ניקוי
+            logger.warning("לא ניתן למחוק קובץ זמני: %s", tmp_path)
 
     STATE["indexing"].add(uploaded["id"])
     background.add_task(_index_in_background, uploaded)

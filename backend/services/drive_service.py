@@ -179,6 +179,11 @@ class DriveService:
                     logger.info("העלאה %s: %d%%", name, int(status.progress() * 100))
         except HttpError as e:
             raise self._friendly_error(e, "העלאת הקובץ") from e
+        finally:
+            # MediaFileUpload מחזיק את הקובץ פתוח; ב-Windows זה חוסם את מחיקת הקובץ הזמני
+            fd = getattr(media, "_fd", None)
+            if fd is not None:
+                fd.close()
         response["fingerprint"] = response.get("md5Checksum") or f"mtime:{response.get('modifiedTime')}"
         return response
 
