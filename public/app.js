@@ -57,6 +57,10 @@
     newChatBtn: $("#newChatBtn"),
     toast: $("#toast"),
     dialog: $("#fileDialog"),
+    chat: $(".chat"),
+    menuBtn: $("#menuBtn"),
+    sidebarClose: $("#sidebarClose"),
+    sidebarBackdrop: $("#sidebarBackdrop"),
   };
 
   let sessionId = store.get("session_id") || newSessionId();
@@ -626,7 +630,10 @@
       ? `<span class="focus-chip"><i class="icon-paperclip"></i><span>${escapeHtml(focusFile)}</span>
            <button type="button" class="focus-clear" aria-label="ביטול מיקוד"><i class="icon-x"></i></button></span>`
       : "";
-    if (focusFile) els.input.focus();
+    if (focusFile) {
+      setSidebar(false); // בנייד: חוזרים לצ'אט (הוא inert כל עוד הסרגל פתוח)
+      els.input.focus();
+    }
     renderFiles(); // מסמן את החוזה הממוקד ברשימה
   }
   els.focusBar.addEventListener("click", (e) => {
@@ -980,6 +987,65 @@
       els.syncBtn.classList.remove("spinning");
     }
   });
+
+  // ======================================================================
+  // נייד: סרגל צד נשלף ומקלדת וירטואלית
+  // ======================================================================
+  const mobileQuery = window.matchMedia("(max-width: 768px)");
+
+  function setSidebar(open) {
+    const isOpen = open && mobileQuery.matches;
+    document.body.classList.toggle("sidebar-open", isOpen);
+    els.menuBtn.setAttribute("aria-expanded", String(isOpen));
+    // בזמן שהסרגל פתוח, הצ'אט שמאחוריו לא נגיש למקלדת ולקורא מסך
+    els.chat.inert = isOpen;
+    if (isOpen) els.sidebarClose.focus();
+  }
+  function closeSidebar() {
+    if (!document.body.classList.contains("sidebar-open")) return;
+    setSidebar(false);
+    els.menuBtn.focus({ preventScroll: true });
+  }
+
+  els.menuBtn.addEventListener("click", () => setSidebar(true));
+  els.sidebarClose.addEventListener("click", closeSidebar);
+  els.sidebarBackdrop.addEventListener("click", closeSidebar);
+  document.addEventListener("keydown", (e) => {
+    // Escape בתוך dialog פתוח סוגר את ה-dialog בלבד
+    if (e.key === "Escape" && !document.querySelector("dialog[open]"))
+      closeSidebar();
+  });
+  // מעבר למסך רחב (סיבוב מסך/שינוי גודל חלון) - הסרגל חוזר להיות חלק מהפריסה
+  mobileQuery.addEventListener("change", () => setSidebar(false));
+
+  // שיחה חדשה מהסרגל - חוזרים לצ'אט (מיקוד בחוזה סוגר את הסרגל בתוך setFocus)
+  els.newChatBtn.addEventListener("click", () => setSidebar(false));
+
+  /**
+   * מקלדת וירטואלית: ב-iOS המקלדת לא מקטינה את 100dvh אלא רק את ה-Visual Viewport.
+   * לכן גובה האפליקציה נקבע לפי visualViewport.height (--app-height ב-CSS), וכך
+   * תיבת הכתיבה נשארת צמודה מעל המקלדת. בזמן שהמקלדת פתוחה מסומן keyboard-open,
+   * כדי לבטל את מרווח ה-Safe Area (המקלדת ממילא מכסה אותו).
+   */
+  const vv = window.visualViewport;
+  if (vv) {
+    const fitViewport = () => {
+      const stick = nearBottom();
+      document.documentElement.style.setProperty(
+        "--app-height",
+        `${Math.round(vv.height)}px`,
+      );
+      document.body.classList.toggle(
+        "keyboard-open",
+        window.innerHeight - vv.height > 120,
+      );
+      // iOS גולל את כל הדף כדי לחשוף את השדה; האפליקציה כבר בגובה הנכון - מחזירים לראש
+      if (mobileQuery.matches && window.scrollY) window.scrollTo(0, 0);
+      if (stick) els.messages.scrollTop = els.messages.scrollHeight;
+    };
+    vv.addEventListener("resize", fitViewport);
+    fitViewport();
+  }
 
   // ---------- אתחול ----------
   if (window.marked) marked.setOptions({ breaks: true, gfm: true });

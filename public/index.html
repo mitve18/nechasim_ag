@@ -13,7 +13,12 @@
 <html lang="he" dir="rtl">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- viewport-fit=cover: נדרש כדי ש-env(safe-area-inset-*) יחזיר ערכים במכשירי iOS עם Notch;
+         interactive-widget: ב-Android המקלדת מקטינה את הפריסה במקום לכסות את תיבת הכתיבה -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content"
+    />
     <title>סוכן חוזים | יחידת נכסים</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -37,6 +42,15 @@
             <div class="brand-title">סוכן חוזים</div>
             <div class="brand-sub">יחידת נכסים</div>
           </div>
+          <!-- סגירת הסרגל - מוצג רק בנייד, כשהסרגל נפתח כשכבה -->
+          <button
+            id="sidebarClose"
+            class="icon-btn sidebar-close"
+            type="button"
+            aria-label="סגירת התפריט"
+          >
+            <i class="icon-x"></i>
+          </button>
         </div>
 
         <button id="newChatBtn" class="btn-accent" type="button">
@@ -88,9 +102,27 @@
           <div id="syncInfo" class="sync-info"></div>
         </div>
       </aside>
+      <!-- רקע כהה מאחורי הסרגל בנייד; לחיצה עליו סוגרת את הסרגל -->
+      <div id="sidebarBackdrop" class="sidebar-backdrop" aria-hidden="true"></div>
 
       <!-- צ'אט -->
       <main class="chat" aria-label="צ'אט עם הסוכן">
+        <!-- כותרת עליונה - מוצגת רק בנייד -->
+        <header class="mobile-header">
+          <button
+            id="menuBtn"
+            class="icon-btn menu-btn"
+            type="button"
+            aria-label="פתיחת התפריט"
+            aria-controls="sidebar"
+            aria-expanded="false"
+          >
+            <i class="icon-menu"></i>
+          </button>
+          <span class="brand-mark" aria-hidden="true">§</span>
+          <div class="mobile-title">סוכן חוזים</div>
+        </header>
+
         <div id="messages" class="messages" aria-live="polite">
           <div id="messageList" class="message-list"></div>
         </div>

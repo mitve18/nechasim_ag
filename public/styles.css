@@ -78,6 +78,7 @@ textarea::placeholder {
 /* ---------- פריסה ---------- */
 .app {
   height: 100vh;
+  height: 100dvh; /* דפדפנים חדשים: גובה המסך בפועל, בלי סרגל הכתובת של הנייד */
   min-height: 640px;
   display: flex;
   gap: clamp(12px, 2vw, 24px);
@@ -119,6 +120,13 @@ textarea::placeholder {
   align-items: center;
   gap: 10px;
   padding: 0 6px 18px;
+}
+
+/* רכיבי נייד בלבד (כותרת עליונה, כפתור סגירה ורקע הסרגל) - מוסתרים במסך רחב */
+.mobile-header,
+.icon-btn.sidebar-close,
+.sidebar-backdrop {
+  display: none;
 }
 .brand-mark {
   width: 32px;
@@ -943,6 +951,7 @@ a.source-chip:hover {
 .draft-dialog {
   width: min(820px, calc(100% - 32px));
   max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 48px);
   flex-direction: column;
 }
 .draft-dialog[open] {
@@ -1052,24 +1061,183 @@ a.source-chip:hover {
   max-width: calc(100% - 32px);
 }
 
-/* ---------- נייד ---------- */
-@media (max-width: 860px) {
+/* ---------- נייד ----------
+   - הצ'אט תופס את כל רוחב המסך; הסרגל נפתח כשכבה (Overlay) מצד ימין עם רקע כהה.
+   - גובה האפליקציה = גובה ה-Visual Viewport (--app-height, מחושב ב-app.js), כך
+     שכשהמקלדת נפתחת תיבת הכתיבה נשארת צמודה לתחתית החלק הגלוי של המסך.
+   - כל הכיווניות לוגית (inline-start = ימין ב-RTL); כיוון ההחלקה נגזר מ---sidebar-off.
+*/
+@media (max-width: 768px) {
+  :root {
+    --sidebar-off: 100%; /* RTL: הסרגל מוסתר מחוץ למסך מימין */
+  }
+  html[dir="ltr"] {
+    --sidebar-off: -100%;
+  }
+  body {
+    overscroll-behavior: none;
+  }
   .app {
-    flex-direction: column;
-    height: auto;
-    min-height: 100vh;
-    padding: 12px 16px;
+    height: var(--app-height, 100dvh);
+    min-height: 0;
+    padding: 0;
+    gap: 0;
   }
+
+  /* --- סרגל צד כשכבה נשלפת --- */
   .sidebar {
-    width: 100%;
-    max-height: 50vh;
-    border-radius: 22px;
+    position: fixed;
+    inset-block: 0;
+    inset-inline-start: 0;
+    z-index: 30;
+    width: min(86vw, 340px);
+    padding-block: calc(16px + env(safe-area-inset-top))
+      calc(12px + env(safe-area-inset-bottom));
+    padding-inline: calc(14px + env(safe-area-inset-right)) 14px;
+    border-radius: 0;
+    border-start-end-radius: 24px;
+    border-end-end-radius: 24px;
+    background: rgba(251, 249, 247, 0.97);
+    transform: translateX(var(--sidebar-off));
+    visibility: hidden;
+    transition:
+      transform 0.28s cubic-bezier(0.32, 0.72, 0, 1),
+      visibility 0s linear 0.28s;
   }
+  .sidebar-open .sidebar {
+    transform: none;
+    visibility: visible;
+    transition: transform 0.28s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 25;
+    background: rgba(20, 12, 8, 0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.28s;
+  }
+  .sidebar-open .sidebar-backdrop {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .icon-btn.sidebar-close {
+    display: flex;
+    margin-inline-start: auto;
+  }
+  .brand {
+    padding-bottom: 14px;
+  }
+
+  /* --- כותרת עליונה --- */
+  .mobile-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+    padding-block: calc(6px + env(safe-area-inset-top)) 6px;
+    padding-inline: calc(8px + env(safe-area-inset-right))
+      calc(8px + env(safe-area-inset-left));
+    background: rgba(251, 249, 247, 0.85);
+    backdrop-filter: blur(16px);
+    box-shadow: 0 1px 0 var(--line);
+    z-index: 3;
+  }
+  .mobile-header .brand-mark {
+    width: 28px;
+    height: 28px;
+    font-size: 15px;
+  }
+  .mobile-title {
+    font-size: 16px;
+    font-weight: 600;
+  }
+  .menu-btn i {
+    font-size: 20px;
+  }
+
+  /* --- צ'אט ברוחב מלא --- */
   .chat {
-    min-height: 80vh;
+    width: 100%;
+    height: 100%;
+  }
+  .messages {
+    overscroll-behavior: contain;
   }
   .message-list {
-    padding-top: 16px;
+    padding: 16px 12px 16px;
+  }
+  .jump-btn {
+    bottom: 150px;
+  }
+
+  /* --- אזור כתיבה צמוד לתחתית, עם מרווח בטוח ל-Home Indicator של iOS --- */
+  .composer-area {
+    max-width: none;
+    flex-shrink: 0;
+    gap: 8px;
+    padding-block: 8px calc(8px + env(safe-area-inset-bottom));
+    padding-inline: calc(10px + env(safe-area-inset-right))
+      calc(10px + env(safe-area-inset-left));
+  }
+  /* כשהמקלדת פתוחה היא מכסה את אזור ה-Home Indicator - אין צורך במרווח */
+  .keyboard-open .composer-area {
+    padding-bottom: 8px;
+  }
+  .composer-hint {
+    display: none; /* קיצורי מקלדת לא רלוונטיים במסך מגע */
+  }
+  .composer {
+    border-radius: 24px;
+    padding: 6px;
+  }
+
+  /* --- גודל מגע מינימלי 44px --- */
+  .chip,
+  .btn-upload,
+  .search input,
+  .btn-ghost,
+  .dialog-actions .btn-accent {
+    min-height: 44px;
+  }
+  .icon-btn,
+  .sync-btn,
+  .file-info {
+    width: 44px;
+    height: 44px;
+  }
+  .icon-btn i {
+    font-size: 17px;
+  }
+  .focus-chip {
+    height: 44px;
+  }
+  .focus-clear {
+    min-width: 44px;
+    min-height: 44px;
+    justify-content: center;
+    align-items: center;
+  }
+  .file-info {
+    top: 50%;
+    transform: translateY(-50%);
+  }
+  .file-body {
+    padding-inline-end: 44px; /* שהשם לא יוסתר מתחת לכפתור כרטיס החוזה */
+  }
+
+  /* --- 16px בשדות קלט: מונע זום אוטומטי של iOS בעת מיקוד --- */
+  .composer textarea,
+  .search input,
+  .draft-title,
+  .draft-editor {
+    font-size: 16px;
+  }
+
+  .msg-actions {
+    margin-inline-start: -12px;
   }
   .empty-state {
     margin-top: 10vh;
@@ -1089,5 +1257,13 @@ a.source-chip:hover {
   }
   .meta-grid dd {
     margin-bottom: 8px;
+  }
+}
+
+@media (max-width: 768px) and (prefers-reduced-motion: reduce) {
+  .sidebar,
+  .sidebar-open .sidebar,
+  .sidebar-backdrop {
+    transition: none;
   }
 }
