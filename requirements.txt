@@ -20,6 +20,7 @@ pymupdf>=1.24
 # Google Drive API
 google-api-python-client>=2.140
 google-auth>=2.30
+google-auth-oauthlib>=1.2  # OAuth של משתמש (InstalledAppFlow ליצירת token.json)
 
 # יצירת מסמכי Word
 python-docx>=1.1

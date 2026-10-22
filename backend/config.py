@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import os
 import tempfile
 from functools import lru_cache
@@ -56,11 +55,10 @@ class Settings(BaseSettings):
     DRIVE_CONTRACTS_FOLDER_ID: str  # מזהה תיקיית MITVE TOOLS - NECHASIM - CONTRACTS ב-Shared Drive
     SYNC_JOB_SECRET: str  # סוד משותף שמגן על נתיב הסנכרון שמופעל ע"י ה-Cron הלילי
 
-    # --- הרשאות Google (אחד מהשניים חובה) ---
-    # בפיתוח מקומי: נתיב לקובץ service_account.json
-    GOOGLE_APPLICATION_CREDENTIALS: Optional[str] = None
-    # ב-Render: תוכן ה-JSON כולו כמשתנה סביבה (אין צורך להעלות קובץ סודי לשרת)
-    GOOGLE_SERVICE_ACCOUNT_JSON: Optional[str] = None
+    # --- הרשאות Google (OAuth של משתמש) ---
+    # ב-Render: תוכן token.json כולו כמשתנה סביבה. בפיתוח מקומי אפשר להשאיר ריק -
+    # אז נקרא token.json, ואם הוא לא קיים נפתחת התחברות בדפדפן עם credentials.json.
+    DRIVE_TOKEN_JSON: Optional[str] = None
 
     # --- תבניות Word בדרייב (אופציונלי) ---
     # תיקייה עם תבניות docx/Google Docs שמכילות משתנים בתחביר Jinja ({{ tenant_name }}).
@@ -131,25 +129,6 @@ class Settings(BaseSettings):
     def webhook_token(self) -> str:
         """טוקן ערוץ ההתראות של הדרייב - נגזר מ-SYNC_JOB_SECRET, כך שאין סוד נוסף לנהל."""
         return hmac.new(self.SYNC_JOB_SECRET.encode(), b"drive-webhook", hashlib.sha256).hexdigest()
-
-    def google_credentials_info(self) -> dict:
-        """
-        מחזיר את פרטי ה-Service Account כמילון.
-
-        סדר עדיפויות: קודם משתנה הסביבה GOOGLE_SERVICE_ACCOUNT_JSON (מתאים ל-Render),
-        ואם הוא לא קיים - קריאת הקובץ שבנתיב GOOGLE_APPLICATION_CREDENTIALS.
-        נתיב יחסי מחושב ביחס לשורש הפרויקט.
-        """
-        if self.GOOGLE_SERVICE_ACCOUNT_JSON:
-            return json.loads(self.GOOGLE_SERVICE_ACCOUNT_JSON)
-        if self.GOOGLE_APPLICATION_CREDENTIALS:
-            path = Path(self.GOOGLE_APPLICATION_CREDENTIALS)
-            if not path.is_absolute():
-                path = BASE_DIR / path
-            return json.loads(path.read_text(encoding="utf-8"))
-        raise RuntimeError(
-            "חסרות הרשאות Google: הגדר GOOGLE_SERVICE_ACCOUNT_JSON או GOOGLE_APPLICATION_CREDENTIALS"
-        )
 
 
 @lru_cache(maxsize=1)

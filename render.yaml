@@ -28,9 +28,9 @@ services:
         sync: false
       - key: DRIVE_CONTRACTS_FOLDER_ID
         sync: false
-      - key: DRIVE_TEMPLATES_FOLDER_ID     # תיקיית תבניות ה-Word (docxtpl) - משותפת עם חשבון השירות
+      - key: DRIVE_TEMPLATES_FOLDER_ID     # תיקיית תבניות ה-Word (docxtpl) - נגישה למשתמש המחובר
         sync: false
-      - key: GOOGLE_SERVICE_ACCOUNT_JSON   # תוכן קובץ service_account.json כולו
+      - key: DRIVE_TOKEN_JSON              # תוכן token.json כולו (נוצר בהתחברות מקומית)
         sync: false
       - key: SYNC_JOB_SECRET
         generateValue: true                # Render מייצר סוד אקראי

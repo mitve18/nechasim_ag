@@ -7,7 +7,7 @@ drive_service.py - אינטגרציה מול Google Drive API.
     העלאה ב-Chunks, הורדה לתיקייה זמנית (/tmp), ייצוא Google Docs ל-PDF ומחיקה.
 
 איך זה עובד:
-    ההזדהות מתבצעת עם Service Account (contracts-bot). מאחר שהתיקייה ב-Shared Drive,
+    ההזדהות מתבצעת ב-OAuth 2.0 עם הרשאות משתמש (token.json / DRIVE_TOKEN_JSON). מאחר שהתיקייה ב-Shared Drive,
     כל קריאה ל-API נשלחת עם supportsAllDrives=True (ובחיפוש גם includeItemsFromAllDrives=True),
     אחרת Google מחזירה "File not found" גם כשיש הרשאה.
 
@@ -21,6 +21,7 @@ drive_service.py - אינטגרציה מול Google Drive API.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import mimetypes
 import os
@@ -29,17 +30,26 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from google.oauth2 import service_account
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
-from backend.config import Settings
+from backend.config import BASE_DIR, Settings
 
 logger = logging.getLogger(__name__)
 
 # הרשאה מלאה לדרייב - נדרשת להעלאה ולמחיקה, לא רק לקריאה
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+# קבצי OAuth מקומיים (בשורש הפרויקט, מחוץ ל-Git):
+# credentials.json - OAuth Client (Desktop app) שהורד מ-Google Cloud Console
+# token.json - הטוקן של המשתמש שנשמר אחרי ההתחברות; את תוכנו מעתיקים ל-DRIVE_TOKEN_JSON ב-Render
+CLIENT_SECRETS_FILE = BASE_DIR / "credentials.json"
+TOKEN_FILE = BASE_DIR / "token.json"
 
 # גודל Chunk להעלאה/הורדה: 5MB (חייב להיות כפולה של 256KB לפי דרישות Google)
 CHUNK_SIZE = 5 * 1024 * 1024
@@ -73,6 +83,55 @@ class DriveServiceError(RuntimeError):
     """שגיאה ידידותית בעברית שמוצגת למשתמש כשהפעולה מול הדרייב נכשלת."""
 
 
+def _load_credentials(settings: Settings) -> Credentials:
+    """
+    טוען הרשאות OAuth של משתמש (User Credentials) עבור ה-Drive API.
+
+    סדר עדיפויות:
+        1. משתנה הסביבה DRIVE_TOKEN_JSON (מתאים ל-Render - תוכן token.json כמחרוזת).
+        2. הקובץ המקומי token.json.
+        3. אם אין טוקן, או שפג תוקפו ואי אפשר לרענן - התחברות אינטראקטיבית בדפדפן
+           (InstalledAppFlow) עם credentials.json. מתאים לפיתוח מקומי בלבד.
+    טוקן חדש או מרוענן נשמר ל-token.json, כדי שהמפתח יוכל להעתיק את תוכנו ל-Render.
+    """
+    creds: Optional[Credentials] = None
+    if settings.DRIVE_TOKEN_JSON:
+        creds = Credentials.from_authorized_user_info(json.loads(settings.DRIVE_TOKEN_JSON), SCOPES)
+    elif TOKEN_FILE.exists():
+        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+
+    if creds and creds.valid:
+        return creds
+
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except RefreshError as e:
+            # Refresh Token שבוטל/פג (למשל אפליקציה במצב Testing - 7 ימים) -> התחברות מחדש
+            logger.warning("רענון טוקן הדרייב נכשל, נדרשת התחברות מחדש: %s", e)
+            creds = None
+    else:
+        creds = None
+
+    if creds is None:
+        if not CLIENT_SECRETS_FILE.exists():
+            raise DriveServiceError(
+                "חסרות הרשאות Google: הגדר DRIVE_TOKEN_JSON, או שים את credentials.json "
+                "בשורש הפרויקט כדי להתחבר בדפדפן."
+            )
+        flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRETS_FILE), SCOPES)
+        creds = flow.run_local_server(port=0)
+
+    # טוקן שהגיע ממשתנה הסביבה לא נכתב לדיסק (ב-Render אין בו צורך, והוא סוד)
+    if not settings.DRIVE_TOKEN_JSON:
+        # הרשאות לבעלים בלבד - הקובץ מכיל Refresh Token ארוך-טווח
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+        os.chmod(TOKEN_FILE, 0o600)
+    return creds
+
+
 class DriveService:
     """
     שירות יחיד לכל הפעולות מול Google Drive.
@@ -83,15 +142,14 @@ class DriveService:
 
     def __init__(self, settings: Settings):
         """
-        יוצר לקוח Drive v3 מאומת באמצעות ה-Service Account.
+        יוצר לקוח Drive v3 מאומת בהרשאות OAuth של משתמש (ראה _load_credentials).
 
         cache_discovery=False מונע אזהרות ושמירת קבצי Cache מיותרים על הדיסק.
+        במהלך ריצה ארוכה, ספריית Google מרעננת את ה-Access Token אוטומטית לפי הצורך.
         """
         self.settings = settings
         self.folder_id = settings.DRIVE_CONTRACTS_FOLDER_ID
-        creds = service_account.Credentials.from_service_account_info(
-            settings.google_credentials_info(), scopes=SCOPES
-        )
+        creds = _load_credentials(settings)
         self._service = build("drive", "v3", credentials=creds, cache_discovery=False)
         self._generated_folder_id: Optional[str] = None
 
@@ -383,16 +441,15 @@ class DriveService:
         """
         ממיר שגיאת HTTP של Google להודעה ברורה בעברית.
 
-        המקרים הנפוצים: ה-Service Account לא חבר ב-Shared Drive (404/403),
-        או שהתיקייה ב-My Drive רגיל ואין לחשבון השירות מכסת אחסון (storageQuotaExceeded).
+        המקרים הנפוצים: המשתמש המחובר לא חבר ב-Shared Drive (404/403),
+        או שנגמרה מכסת האחסון בחשבון (storageQuotaExceeded).
         """
         text = str(e)
         if "storageQuotaExceeded" in text:
-            msg = (f"{action} נכשלה: לחשבון השירות אין מכסת אחסון. "
-                   "ודא שהתיקייה נמצאת ב-Shared Drive ושחשבון השירות חבר בו.")
+            msg = (f"{action} נכשלה: נגמרה מכסת האחסון בחשבון Google המחובר.")
         elif e.resp is not None and e.resp.status in (403, 404):
             msg = (f"{action} נכשלה: אין הרשאה או שהקובץ לא נמצא. "
-                   "ודא שחשבון השירות הוא חבר ב-Shared Drive בתפקיד Content Manager.")
+                   "ודא שהמשתמש המחובר הוא חבר ב-Shared Drive בתפקיד Content Manager.")
         else:
             msg = f"{action} נכשלה: {text[:300]}"
         logger.error(msg)
