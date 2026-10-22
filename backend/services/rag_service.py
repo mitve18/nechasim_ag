@@ -43,18 +43,20 @@ import os
 import re
 import threading
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Literal, Optional
 
 import fitz  # PyMuPDF
 import openai
 from openai import ContentFilterFinishReasonError, LengthFinishReasonError, OpenAI
 from pydantic import BaseModel, Field
 from sqlalchemy import (
-    Column, DateTime, Integer, MetaData, String, Table, Text, case, create_engine, delete, select, text,
+    BigInteger, Column, DateTime, Integer, MetaData, String, Table, Text, case, create_engine, delete,
+    func, or_, select, text, update,
 )
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.engine import Engine
 
+from agno.filters import EQ, IN
 from agno.knowledge.document import Document
 from agno.knowledge.embedder.openai import OpenAIEmbedder
 from agno.vectordb.pgvector import PgVector, SearchType
@@ -95,6 +97,24 @@ OCR_SYSTEM_PROMPT = (
     "תת-סעיפים כרשימה. טבלאות כטבלת Markdown. אל תמציא טקסט ואל תסכם. "
     "במטא-דאטה מלא רק מה שמופיע בעמוד הזה, בקצרה (financial_terms עד 300 תווים); "
     "תאריכים בפורמט YYYY-MM-DD."
+)
+
+# סוגי המסמכים האפשריים - רשימה סגורה, כדי שסינון מוקדם (Pre-Filter) בחיפוש יהיה התאמה מדויקת.
+# אותה רשימה מופיעה ב-Docstring של search_contracts (tools.py) - יש לעדכן את שתיהן יחד.
+DOCUMENT_TYPES = ("שכירות", "חכירה", "הרשאה", "ניהול", "מכר", "תוספת להסכם", "אחר")
+DocumentType = Literal["שכירות", "חכירה", "הרשאה", "ניהול", "מכר", "תוספת להסכם", "אחר"]
+
+
+# DocumentClass - פלט ה-Classifier: סוג המסמך + הצדדים. Structured Outputs מבטיח JSON תקין.
+class DocumentClass(BaseModel):
+    document_type: DocumentType = Field(description="סוג ההסכם")
+    parties: List[str] = Field(default_factory=list, description="שמות הצדדים להסכם")
+
+
+CLASSIFIER_SYSTEM_PROMPT = (
+    "סווג מסמך משפטי בעברית לפי עמודיו הראשונים. document_type: הסוג המתאים ביותר מהרשימה; "
+    "'תוספת להסכם' לתוספת/נספח/עדכון להסכם קיים; 'אחר' אם אינו מתאים לאף סוג. "
+    "parties: שמות הצדדים כפי שמופיעים במסמך (בלי תפקידים כמו 'המשכיר')."
 )
 
 METADATA_SYSTEM_PROMPT = (
@@ -190,20 +210,39 @@ class RagService:
             Column("retries", Integer, default=0),  # כשלונות רצופים על אותה גרסת קובץ
             Column("indexed_at", DateTime(timezone=True)),
         )
+        # ערוץ ההתראות הפעיל של הדרייב (שורה אחת) - שורד אתחול של השרת, כך שלא נפתחים ערוצים כפולים
+        self.drive_watch = Table(
+            "drive_watch",
+            self._metadata,
+            Column("id", Integer, primary_key=True),  # תמיד 1
+            Column("channel_id", String, nullable=False),
+            Column("resource_id", String, nullable=False),
+            Column("expiration", BigInteger, nullable=False),  # מילישניות מאז 1970 (הפורמט של Google)
+        )
         with self.engine.begin() as conn:
             conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {settings.DB_SCHEMA}"))
         self._metadata.create_all(self.engine)
         # create_all לא משנה טבלה קיימת - מוסיפים עמודות חדשות ידנית (Idempotent)
+        chunks = f"{settings.DB_SCHEMA}.{settings.VECTOR_TABLE}"
         with self.engine.begin() as conn:
             conn.execute(text(
                 f"ALTER TABLE {settings.DB_SCHEMA}.{settings.TRACKING_TABLE} "
                 "ADD COLUMN IF NOT EXISTS retries INTEGER DEFAULT 0"
             ))
+            # אינדקסים לסינון המוקדם (Pre-Filter) של החיפוש: Agno מתרגם EQ/IN ל-meta_data->>'key',
+            # ו-delete_by_metadata/get_file_chunks משתמשים ב-@> (GIN). כך ה-WHERE מצמצם את
+            # המקטעים לפני חישוב הדמיון, גם כשהטבלה גדלה לעשרות אלפי מקטעים.
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS {settings.VECTOR_TABLE}_file_id_idx "
+                              f"ON {chunks} ((meta_data->>'file_id'))"))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS {settings.VECTOR_TABLE}_doc_type_idx "
+                              f"ON {chunks} ((meta_data->>'document_type'))"))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS {settings.VECTOR_TABLE}_meta_gin_idx "
+                              f"ON {chunks} USING gin (meta_data jsonb_path_ops)"))
 
     # ==================================================================
     # Delta Sync
     # ==================================================================
-    def delta_sync(self) -> Dict[str, Any]:
+    def delta_sync(self, skip_ids: Iterable[str] = ()) -> Dict[str, Any]:
         """
         מסנכרן את האינדקס מול תיקיית הדרייב - מעבד רק את מה שהשתנה.
 
@@ -213,21 +252,29 @@ class RagService:
             3. קובץ שה-fingerprint שלו זהה ו-status=indexed -> דילוג (0 טוקנים).
             4. קובץ חדש / שהשתנה / שנכשל בעבר -> הורדה, פיענוח ואינדוקס מחדש.
             5. קובץ שקיים בטבלה ולא בדרייב -> מחיקת המקטעים והרשומה.
+            6. סיווג (document_type) לקבצים ישנים שאונדקסו לפני שהיה Classifier.
+
+        skip_ids - קבצים שכבר מאונדקסים כרגע ברקע (העלאה מהממשק). בלעדיו, ה-Webhook
+        שהעלאה שלנו עצמה מפעילה היה מאנדקס את אותו קובץ פעמיים במקביל.
 
         מחזיר סיכום מספרי שמוצג בממשק ובלוגים של ה-Cron.
         """
         if not self._sync_lock.acquire(blocking=False):
             return {"status": "busy", "message": "סנכרון כבר רץ ברקע"}
         try:
+            skip = set(skip_ids)
             drive_files = self.drive.list_files()
             with self.engine.connect() as conn:
                 rows = {r.file_id: r for r in conn.execute(select(self.tracking)).fetchall()}
 
             summary = {"status": "ok", "total": len(drive_files), "new": 0, "updated": 0,
-                       "skipped": 0, "removed": 0, "failed": 0, "gave_up": 0, "errors": []}
+                       "skipped": 0, "removed": 0, "failed": 0, "gave_up": 0, "classified": 0, "errors": []}
             drive_ids = set()
             for f in drive_files:
                 drive_ids.add(f["id"])
+                if f["id"] in skip:
+                    summary["skipped"] += 1
+                    continue
                 row = rows.get(f["id"])
                 same_version = bool(row) and row.fingerprint == f["fingerprint"]
                 if same_version and row.status == "indexed":
@@ -256,6 +303,12 @@ class RagService:
                 except Exception as e:  # noqa: BLE001
                     logger.exception("הסרת קובץ %s מהאינדקס נכשלה", file_id)
                     summary["errors"].append(f"הסרה {file_id}: {str(e)[:200]}")
+
+            try:
+                summary["classified"] = self.classify_missing()
+            except Exception as e:  # noqa: BLE001 - סיווג רטרואקטיבי לא מכשיל את הסנכרון
+                logger.exception("סיווג קבצים קיימים נכשל")
+                summary["errors"].append(f"סיווג: {str(e)[:200]}")
             logger.info("Delta Sync הסתיים: %s", summary)
             return summary
         finally:
@@ -276,6 +329,13 @@ class RagService:
             local_path = self.drive.download_to_tmp(file)
             result = self.extract(local_path)
             meta = result["metadata"]
+            # Classifier: סוג מסמך + צדדים מ-2 העמודים הראשונים בלבד (מודל קטן, JSON קשיח).
+            # נשמר במטא-דאטה של הקובץ ושל כל מקטע - בסיס לסינון המוקדם בחיפוש.
+            cls = self.classify_document(result["first_pages"])
+            meta["document_type"] = cls.document_type
+            for p in cls.parties:
+                if p and p not in meta["parties"] and len(meta["parties"]) < _MAX_PARTIES:
+                    meta["parties"].append(p[:120])
             chunks = self.chunk_by_sections(result["markdown"], meta, file)
 
             if not chunks:
@@ -354,14 +414,16 @@ class RagService:
         """
         מפענח PDF או תמונה ומחזיר Markdown מחולק לסעיפים + מטא-דאטה.
 
-        ההחלטה מתבצעת לכל עמוד בנפרד:
-            - עמוד עם 50 תווים או יותר של טקסט דיגיטלי -> שימוש בטקסט (חינם).
-            - עמוד עם פחות מ-50 תווים (סרוק) או קובץ תמונה -> המרה לתמונה ב-150 DPI
-              ושליחה ל-gpt-4o Vision עם Structured Outputs.
-        כך חוזה דיגיטלי עם נספח סרוק אחד משלם OCR רק על הנספח.
+        שער OCR דטרמיניסטי, לכל עמוד בנפרד:
+            1. תמיד קודם חילוץ טקסט מקומי עם PyMuPDF (חינם, ללא LLM).
+            2. רק אם התקבלו פחות מ-MIN_CHARS_PER_PAGE (50) תווים - העמוד נחשב סרוק,
+               מומר לתמונה ב-150 DPI ונשלח ל-gpt-4o Vision (דיוק גבוה בעברית, בטבלאות ובחותמות).
+        כך חוזה דיגיטלי לא עולה טוקני OCR בכלל, וחוזה דיגיטלי עם נספח סרוק משלם רק על הנספח.
 
-        fitz.open פותח גם קבצי תמונה (PNG/JPG/TIFF) כמסמך בן עמוד אחד ללא טקסט,
-        ולכן הם עוברים אוטומטית במסלול ה-OCR - אין צורך בקוד נפרד לתמונות.
+        fitz.open פותח גם קבצי תמונה (PNG/JPG/TIFF) כמסמך בן עמוד אחד ללא טקסט
+        (is_pdf=False), ולכן הם עוברים ישירות למסלול ה-OCR.
+
+        first_pages - Markdown של 2 העמודים הראשונים, הקלט היחיד של ה-Classifier.
         """
         parts: List[str] = []
         merged = ContractMetadata()
@@ -404,6 +466,7 @@ class RagService:
         if failed_pages and len(failed_pages) == page_count:
             raise RuntimeError(f"אף עמוד לא פוענח ({page_count} עמודים)")
 
+        first_pages = "\n\n".join(parts[:2])[: self.settings.CLASSIFIER_SAMPLE_CHARS]
         markdown = "\n\n".join(p for p in parts if p.strip())
         del parts
 
@@ -414,6 +477,7 @@ class RagService:
         extraction = "ocr" if not digital_pages else ("digital" if not ocr_pages else "mixed")
         return {
             "markdown": markdown,
+            "first_pages": first_pages,
             "metadata": merged.model_dump(),
             "pages": page_count,
             "ocr_pages": ocr_pages,
@@ -515,6 +579,77 @@ class RagService:
                 break
         return ContractMetadata()
 
+    # ==================================================================
+    # Classifier - סיווג סוג המסמך לפני האינדוקס
+    # ==================================================================
+    def classify_document(self, text_sample: str) -> DocumentClass:
+        """
+        מיקרו-סוכן סיווג: מקבל רק את 2 העמודים הראשונים ומחזיר JSON קשיח
+        {"document_type": ..., "parties": [...]} (Structured Outputs, מודל קטן).
+
+        עלות קבועה וזניחה (~1-2K טוקנים) בכל אורך מסמך. כשל -> "אחר", האינדוקס ממשיך.
+        """
+        sample = (text_sample or "").strip()[: self.settings.CLASSIFIER_SAMPLE_CHARS]
+        if not sample:
+            return DocumentClass(document_type="אחר")
+        try:
+            completion = self.openai.chat.completions.parse(
+                model=self.settings.METADATA_MODEL,
+                temperature=0,
+                max_tokens=300,
+                response_format=DocumentClass,
+                messages=[
+                    {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
+                    {"role": "user", "content": sample},
+                ],
+            )
+            return completion.choices[0].message.parsed or DocumentClass(document_type="אחר")
+        except _FATAL_OPENAI_ERRORS:
+            raise  # עומס/הרשאה - הקובץ ינוסה שוב בסנכרון הבא, כמו ב-OCR
+        except Exception as e:  # noqa: BLE001 - סיווג שנכשל לא מונע אינדוקס
+            logger.warning("סיווג המסמך נכשל: %s", e)
+            return DocumentClass(document_type="אחר")
+
+    def classify_missing(self, max_files: int = 50) -> int:
+        """
+        מסווג קבצים שאונדקסו לפני שהיה Classifier - בלי OCR ובלי Embeddings מחדש.
+
+        הטקסט נלקח מהמקטעים שכבר שמורים ב-PgVector, ו-document_type נכתב גם לטבלת
+        המעקב וגם ל-meta_data של כל מקטע (עדכון JSONB במקום). מוגבל ל-max_files בכל
+        סנכרון כדי שהריצה הראשונה על מאגר גדול לא תתארך.
+        """
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(self.tracking.c.file_id, self.tracking.c.metadata)
+                .where(self.tracking.c.status == "indexed")
+                .where(or_(self.tracking.c.metadata.is_(None),
+                           ~self.tracking.c.metadata.has_key("document_type")))
+                .limit(max_files)
+            ).fetchall()
+        chunks_table = self.vector_db.table
+        done = 0
+        for r in rows:
+            body = self.get_file_chunks(r.file_id, max_chars=self.settings.CLASSIFIER_SAMPLE_CHARS)
+            cls = self.classify_document(body)
+            meta = dict(r.metadata or {})
+            meta["document_type"] = cls.document_type
+            parties = list(meta.get("parties") or [])
+            for p in cls.parties:
+                if p and p not in parties and len(parties) < _MAX_PARTIES:
+                    parties.append(p[:120])
+            meta["parties"] = parties
+            with self.engine.begin() as conn:
+                conn.execute(update(self.tracking).where(self.tracking.c.file_id == r.file_id)
+                             .values(metadata=meta))
+                conn.execute(
+                    update(chunks_table)
+                    .where(chunks_table.c.meta_data.contains({"file_id": r.file_id}))
+                    .values(meta_data=chunks_table.c.meta_data.op("||")(
+                        func.jsonb_build_object("document_type", cls.document_type)))
+                )
+            done += 1
+        return done
+
     @staticmethod
     def _merge_metadata(target: ContractMetadata, source: ContractMetadata) -> None:
         """
@@ -599,6 +734,7 @@ class RagService:
             "block_parcel": meta.get("block_parcel"),
             "start_date": meta.get("start_date"),
             "end_date": meta.get("end_date"),
+            "document_type": meta.get("document_type") or "אחר",  # מפתח הסינון המוקדם בחיפוש
         }
         for section_title, body in sections:
             pieces = [body] if len(body) <= max_len else [
@@ -625,16 +761,64 @@ class RagService:
     # ==================================================================
     # חיפוש ושאילתות
     # ==================================================================
-    def search(self, query: str, file_id: Optional[str] = None, limit: Optional[int] = None) -> List[Document]:
+    def search(self, query: str, file_id: Optional[str] = None, limit: Optional[int] = None,
+               document_type: Optional[str] = None, file_ids: Optional[List[str]] = None) -> List[Document]:
         """
-        חיפוש היברידי (וקטורי + מילות מפתח) ב-PgVector.
+        חיפוש היברידי (וקטורי + מילות מפתח) ב-PgVector, עם סינון מוקדם לפי מטא-דאטה.
 
-        limit ברירת מחדל = RAG_LIMIT (5): זו התקרה הקשיחה לכמות הטקסט שנכנסת לקונטקסט
-        של הסוכן מכל חיפוש. ניתן לצמצם לחוזה אחד באמצעות file_id.
+        הסינון (document_type / file_id) נכנס ל-WHERE של אותה שאילתת SQL, כך ש-Postgres
+        מצמצם את המקטעים *לפני* חישוב הדמיון והדירוג (ORDER BY score LIMIT k) - בעזרת
+        האינדקסים על meta_data->>'file_id' / 'document_type'. כל 5 המקטעים שחוזרים
+        שייכים לקבוצה המבוקשת, ולא "מתבזבזים" על חוזים לא רלוונטיים.
+
+        limit ברירת מחדל = RAG_LIMIT (5): התקרה הקשיחה לכמות הטקסט שנכנסת לקונטקסט.
         """
         limit = min(limit or self.settings.RAG_LIMIT, self.settings.RAG_LIMIT)
-        filters = {"file_id": file_id} if file_id else None
-        return self.vector_db.search(query=query, limit=limit, filters=filters)
+        ids = list(file_ids or [])
+        if file_id:
+            ids = [file_id] if not file_ids else [i for i in ids if i == file_id]
+            if not ids:
+                return []
+        filters = []
+        if document_type:
+            filters.append(EQ("document_type", document_type))
+        if ids:
+            filters.append(IN("file_id", ids))
+        return self.vector_db.search(query=query, limit=limit, filters=filters or None)
+
+    def find_file_ids(self, asset: str) -> List[str]:
+        """
+        מזהי החוזים של נכס מסוים: התאמה חלקית לגוש/חלקה, לתיאור הנכס או לשם הקובץ.
+        (SQL על טבלת המעקב בלבד - ללא LLM.)
+        """
+        pattern = f"%{asset.strip()}%"
+        t = self.tracking
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(t.c.file_id).where(or_(
+                    t.c.metadata["block_parcel"].astext.ilike(pattern),
+                    t.c.metadata["property"].astext.ilike(pattern),
+                    t.c.name.ilike(pattern),
+                ))
+            ).fetchall()
+        return [r.file_id for r in rows]
+
+    # ==================================================================
+    # ערוץ התראות הדרייב (Webhook)
+    # ==================================================================
+    def get_watch(self) -> Optional[Dict[str, Any]]:
+        with self.engine.connect() as conn:
+            row = conn.execute(select(self.drive_watch).where(self.drive_watch.c.id == 1)).mappings().first()
+        return dict(row) if row else None
+
+    def save_watch(self, watch: Dict[str, Any]) -> None:
+        values = {"id": 1, "channel_id": watch["channel_id"], "resource_id": watch["resource_id"],
+                  "expiration": watch["expiration"]}
+        stmt = pg_insert(self.drive_watch).values(**values)
+        stmt = stmt.on_conflict_do_update(index_elements=[self.drive_watch.c.id],
+                                          set_={k: stmt.excluded[k] for k in values if k != "id"})
+        with self.engine.begin() as conn:
+            conn.execute(stmt)
 
     def get_file_chunks(self, file_id: str, max_chars: int) -> str:
         """

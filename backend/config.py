@@ -20,6 +20,8 @@ config.py - טעינת משתני סביבה ואימות הגדרות.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import tempfile
@@ -87,6 +89,14 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP: int = 200  # חפיפה בין תת-מקטעים של סעיף ארוך כדי לא לאבד הקשר
     TOOL_RESULT_MAX_CHARS: int = 6000  # תקרת אורך לפלט של כל כלי - מונע "הצפת" הקונטקסט
     MAX_INDEX_RETRIES: int = 3  # אחרי כמה כשלונות על אותה גרסת קובץ הסנכרון הלילי מפסיק לנסות (חוסך OCR)
+    CLASSIFIER_SAMPLE_CHARS: int = 4000  # תקרת תווים מ-2 העמודים הראשונים שנשלחים לסיווג סוג המסמך
+
+    # --- סנכרון בזמן אמת (Drive Push Notifications) ---
+    # הכתובת הציבורית של השרת (HTTPS). ב-Render מוגדר אוטומטית RENDER_EXTERNAL_URL;
+    # בלי כתובת ציבורית ה-Webhook לא נרשם והמערכת נשארת עם סנכרון לילי + ידני.
+    PUBLIC_BASE_URL: Optional[str] = os.getenv("RENDER_EXTERNAL_URL")
+    WEBHOOK_DEBOUNCE_SECONDS: int = 20  # איחוד "גל" של התראות מהדרייב לסנכרון אחד
+    DRIVE_WATCH_TTL_HOURS: int = 72  # תוקף ערוץ ההתראות; מחודש בעלייה ובסנכרון הלילי
 
     # --- טבלאות ב-Postgres ---
     VECTOR_TABLE: str = "contract_chunks"
@@ -116,6 +126,11 @@ class Settings(BaseSettings):
             if v.startswith(prefix):
                 return "postgresql+psycopg://" + v[len(prefix):]
         return v
+
+    @property
+    def webhook_token(self) -> str:
+        """טוקן ערוץ ההתראות של הדרייב - נגזר מ-SYNC_JOB_SECRET, כך שאין סוד נוסף לנהל."""
+        return hmac.new(self.SYNC_JOB_SECRET.encode(), b"drive-webhook", hashlib.sha256).hexdigest()
 
     def google_credentials_info(self) -> dict:
         """

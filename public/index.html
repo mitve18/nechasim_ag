@@ -185,6 +185,34 @@
       </div>
     </dialog>
 
+    <!-- אשף מסמכים: טיוטה שהסוכן הכין -> עריכה -> שמירה ל-Word (ללא LLM) -->
+    <dialog id="draftDialog" class="file-dialog draft-dialog">
+      <form method="dialog" class="dialog-head">
+        <input id="draftTitle" class="draft-title" type="text" maxlength="200" aria-label="כותרת המסמך" />
+        <button class="icon-btn" aria-label="סגירה"><i class="icon-x"></i></button>
+      </form>
+      <div class="draft-toolbar" role="toolbar" aria-label="עיצוב טקסט">
+        <button type="button" class="icon-btn" data-cmd="bold" title="מודגש"><i class="icon-bold"></i></button>
+        <button type="button" class="icon-btn" data-cmd="italic" title="נטוי"><i class="icon-italic"></i></button>
+        <button type="button" class="icon-btn" data-cmd="underline" title="קו תחתון"><i class="icon-underline"></i></button>
+        <span class="draft-sep"></span>
+        <button type="button" class="icon-btn" data-cmd="formatBlock" data-arg="h2" title="כותרת"><i class="icon-heading-2"></i></button>
+        <button type="button" class="icon-btn" data-cmd="formatBlock" data-arg="p" title="פסקה רגילה"><i class="icon-pilcrow"></i></button>
+        <button type="button" class="icon-btn" data-cmd="insertUnorderedList" title="רשימת תבליטים"><i class="icon-list"></i></button>
+        <button type="button" class="icon-btn" data-cmd="insertOrderedList" title="רשימה ממוספרת"><i class="icon-list-ordered"></i></button>
+        <span class="draft-sep"></span>
+        <button type="button" class="icon-btn" data-cmd="undo" title="ביטול פעולה"><i class="icon-undo-2"></i></button>
+        <button type="button" class="icon-btn" data-cmd="redo" title="ביצוע מחדש"><i class="icon-redo-2"></i></button>
+      </div>
+      <div id="draftEditor" class="draft-editor" contenteditable="true" dir="rtl" spellcheck="false"
+           role="textbox" aria-multiline="true" aria-label="תוכן המסמך"></div>
+      <div class="dialog-actions">
+        <button id="draftSave" class="btn-accent" type="button"><i class="icon-file-down"></i>שמירה ל-Word</button>
+        <button id="draftCancel" class="btn-ghost" type="button">סגירה</button>
+        <span class="draft-hint">השינויים נשמרים בטיוטה עד שתסגור את השיחה</span>
+      </div>
+    </dialog>
+
     <div id="toast" class="toast" role="status" hidden></div>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>

@@ -25,6 +25,7 @@ import logging
 import mimetypes
 import os
 import re
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -323,6 +324,56 @@ class DriveService:
             ).execute(num_retries=NUM_RETRIES)
         except HttpError as e:
             raise self._friendly_error(e, "מחיקת הקובץ") from e
+
+    # ------------------------------------------------------------------
+    # התראות בזמן אמת (Push Notifications) על שינויים ב-Shared Drive
+    # ------------------------------------------------------------------
+    def get_drive_id(self) -> Optional[str]:
+        """מזהה ה-Shared Drive שבו נמצאת תיקיית החוזים (None אם התיקייה ב-My Drive)."""
+        if not hasattr(self, "_drive_id"):
+            try:
+                meta = self._service.files().get(
+                    fileId=self.folder_id, fields="driveId", supportsAllDrives=True
+                ).execute(num_retries=NUM_RETRIES)
+            except HttpError as e:
+                raise self._friendly_error(e, "שליפת פרטי ה-Shared Drive") from e
+            self._drive_id = meta.get("driveId")
+        return self._drive_id
+
+    def start_changes_watch(self, address: str, token: str, ttl_hours: int = 72) -> Dict[str, Any]:
+        """
+        נרשם להתראות Push על כל שינוי ב-Shared Drive (changes.watch).
+
+        Google שולחת POST לכתובת address בכל שינוי, עם הכותרת X-Goog-Channel-Token=token.
+        ההתראה עצמה לא מכילה פרטים - היא רק "טריגר", והשרת מריץ Delta Sync (שמעבד רק
+        את מה שהשתנה בתיקיית החוזים). לערוץ יש תוקף, ולכן הוא מחודש מעת לעת.
+        """
+        drive_id = self.get_drive_id()
+        scope = {"driveId": drive_id, "supportsAllDrives": True} if drive_id else {}
+        expiration_ms = int((time.time() + ttl_hours * 3600) * 1000)
+        try:
+            start = self._service.changes().getStartPageToken(**scope).execute(num_retries=NUM_RETRIES)
+            channel = self._service.changes().watch(
+                pageToken=start["startPageToken"],
+                includeItemsFromAllDrives=bool(drive_id),
+                body={"id": uuid.uuid4().hex, "type": "web_hook", "address": address,
+                      "token": token, "expiration": expiration_ms},
+                **scope,
+            ).execute(num_retries=NUM_RETRIES)
+        except HttpError as e:
+            raise self._friendly_error(e, "רישום להתראות דרייב") from e
+        return {
+            "channel_id": channel["id"],
+            "resource_id": channel["resourceId"],
+            "expiration": int(channel.get("expiration") or expiration_ms),
+        }
+
+    def stop_watch(self, channel_id: str, resource_id: str) -> None:
+        """מבטל ערוץ התראות ישן (שגיאה מתעלמת - ערוץ שפג תוקפו כבר לא קיים)."""
+        try:
+            self._service.channels().stop(body={"id": channel_id, "resourceId": resource_id}).execute()
+        except HttpError as e:
+            logger.info("ביטול ערוץ התראות %s נכשל (כנראה כבר פג): %s", channel_id, e)
 
     # ------------------------------------------------------------------
     # עזר

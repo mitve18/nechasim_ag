@@ -7,7 +7,7 @@ tools.py - מחלקת הכלים היחידה של הסוכן: ContractsToolkit.
         2. אנליזה            - list_expiring_contracts, summarize_contract, compare_contracts
         3. אינדוקס           - get_index_status
         4. הפקת מסמכים       - list_document_templates, generate_document_from_template,
-                               generate_word_document (מסמך חופשי ללא תבנית)
+                               draft_document_html (טיוטה חופשית לעריכה בממשק -> Word)
 
     פעולות ניהול הדרייב (מחיקה, סנכרון, רשימת קבצים) קיימות בממשק בלבד ולא כאן:
     כך הגדרות הכלים שנשלחות בכל קריאה קטנות יותר, והסוכן לא יכול למחוק קובץ בטעות.
@@ -35,7 +35,7 @@ from agno.tools import Toolkit
 
 from backend.config import Settings
 from backend.services.docx_service import DocxService
-from backend.services.rag_service import RagService
+from backend.services.rag_service import DOCUMENT_TYPES, RagService
 from backend.services.template_service import TemplateService
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,7 @@ class ContractsToolkit(Toolkit):
                 # 4. הפקת מסמכים
                 self.list_document_templates,
                 self.generate_document_from_template,
-                self.generate_word_document,
+                self.draft_document_html,
             ],
         )
 
@@ -95,22 +95,32 @@ class ContractsToolkit(Toolkit):
     # ==================================================================
     # קטגוריה 1: חיפוש ושליפה
     # ==================================================================
-    def search_contracts(self, query: str, file_name: str = "") -> str:
-        """חיפוש היברידי בחוזים. מחזיר עד 5 מקטעים מקובצים לפי חוזה, עם סעיף.
+    def search_contracts(self, query: str, file_name: str = "", document_type: str = "", asset: str = "") -> str:
+        """חיפוש היברידי בחוזים, עם סינון מוקדם. מחזיר עד 5 מקטעים מקובצים לפי חוזה, עם סעיף.
 
         Args:
             query: שאלה או מילות מפתח בעברית.
-            file_name: אופציונלי - שם/חלק משם קובץ לצמצום החיפוש לחוזה אחד.
+            file_name: אופציונלי - שם/חלק משם קובץ לצמצום לחוזה אחד.
+            document_type: אופציונלי - אחד מ: שכירות, חכירה, הרשאה, ניהול, מכר, תוספת להסכם, אחר.
+            asset: אופציונלי - נכס: גוש/חלקה, כתובת או שם מתחם (התאמה חלקית).
         """
+        document_type = document_type.strip()
+        if document_type and document_type not in DOCUMENT_TYPES:
+            return f"סוג מסמך לא מוכר '{document_type}'. ערכים אפשריים: {', '.join(DOCUMENT_TYPES)}."
+        file_ids = None
+        if asset.strip():
+            file_ids = self.rag.find_file_ids(asset)
+            if not file_ids:
+                return f"לא נמצא נכס שתואם '{asset}'."
         file_id = None
         if file_name:
             f = self._resolve(file_name)
             if not f:
                 return f"לא נמצא חוזה בשם '{file_name}'."
             file_id = f["file_id"]
-        docs = self.rag.search(query, file_id=file_id)
+        docs = self.rag.search(query, file_id=file_id, document_type=document_type or None, file_ids=file_ids)
         if not docs:
-            return "לא נמצאו מקטעים רלוונטיים."
+            return "לא נמצאו מקטעים רלוונטיים" + (" עם הסינון שנבחר." if document_type or asset else ".")
         return json.dumps(group_chunks(docs, self.settings.TOOL_RESULT_MAX_CHARS), ensure_ascii=False)
 
     def get_contract_metadata(self, file_name: str) -> str:
@@ -214,14 +224,19 @@ class ContractsToolkit(Toolkit):
             result["next"] = "שאל את המשתמש על המשתנים החסרים בהודעה אחת (שדה אופציונלי אפשר לשלוח כ-\"\")."
         return json.dumps(result, ensure_ascii=False)
 
-    def generate_word_document(self, title: str, content_markdown: str) -> str:
-        """מסמך Word חופשי (סיכום/דוח/השוואה) מ-Markdown, כשאין תבנית מתאימה.
+    def draft_document_html(self, title: str, content: str, doc_type: str = "free") -> str:
+        """טיוטת מסמך חופשי (מכתב/סיכום/דוח) שנפתחת למשתמש לעריכה לפני שמירה ל-Word.
 
         Args:
             title: כותרת המסמך.
-            content_markdown: גוף המסמך ב-Markdown (כותרות, רשימות, טבלאות, **מודגש**).
+            content: גוף המסמך ב-Markdown או HTML (כותרות, רשימות, טבלאות, מודגש).
+            doc_type: אופציונלי - שם תבנית מוסדית (ברירת מחדל free = base.docx).
         """
-        return json.dumps(self.docx.build(title, content_markdown), ensure_ascii=False)
+        # הטיוטה עצמה נשלחת לממשק כאירוע "draft" מתוך ארגומנטי הכלי (main.py);
+        # למודל חוזר אישור קצר בלבד - הגוף לא נכנס שוב לקונטקסט.
+        if not content.strip():
+            return "התוכן ריק - לא נוצרה טיוטה."
+        return "הטיוטה נפתחה למשתמש בעורך. אמור לו בקצרה שיוכל לערוך ולשמור ל-Word; אל תחזור על תוכנה."
 
 
 # ----------------------------------------------------------------------

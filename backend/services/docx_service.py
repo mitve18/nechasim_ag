@@ -20,14 +20,18 @@ docx_service.py - מנוע הפקת מסמכי Word (RTL) מתבניות מוס�
 
 from __future__ import annotations
 
+import io
 import logging
 import re
 import uuid
+import zipfile
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from docx import Document as DocxDocument
+from docxtpl import DocxTemplate
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -86,6 +90,38 @@ class DocxService:
         doc.save(path)
         return publish(self.drive, path)
 
+    def build_from_html(self, title: str, html: str, doc_type: str = "free") -> Dict[str, Any]:
+        """
+        שלב 2 באשף המסמכים: ממיר את הטיוטה שהמשתמש ערך בממשק (HTML) למסמך Word.
+
+        - התבנית (templates/<doc_type>.docx או base.docx) נטענת עם docxtpl.
+        - פסקת {{body}} בתבנית הופכת (בזיכרון) ל-{{p body}}, והגוף מוזרק אליה כ-Subdoc
+          שנבנה מה-HTML: כותרות, פסקאות, מודגש/נטוי/קו תחתון, רשימות וטבלאות - הכול RTL.
+        - {{title}} ו-{{date}} בתבנית מתמלאים ע"י Jinja של docxtpl.
+        - ציטוטי (קובץ, סעיף) הופכים להפניות [n] עם סעיף "מקורות", כמו ב-build.
+        ללא LLM - ההמרה מקומית לחלוטין.
+        """
+        html, sources = self._extract_citations(html)
+        tpl = DocxTemplate(self._template_source(doc_type))
+        docx = tpl.get_docx()
+        _set_rtl_defaults(docx)
+        if not _promote_body_anchor(docx):
+            docx.add_paragraph("{{p body}}")  # תבנית בלי {{body}} -> הגוף בסוף המסמך
+
+        sd = tpl.new_subdoc()
+        if not _template_has(docx, "title"):
+            _add_paragraph(sd, title, style="Title")
+        parser = _HtmlToDocx(sd)
+        parser.feed(html)
+        parser.close()
+        if sources:
+            self._render_sources(sd, sources)
+
+        tpl.render({"title": title, "date": datetime.now().strftime("%d/%m/%Y"), "body": sd})
+        path = output_path(self.settings, title)
+        tpl.save(path)
+        return publish(self.drive, path)
+
     # ------------------------------------------------------------------
     # תבנית
     # ------------------------------------------------------------------
@@ -99,6 +135,26 @@ class DocxService:
                 except Exception as e:  # noqa: BLE001 - תבנית נעולה/פגומה לא מונעת הפקת מסמך
                     logger.warning("לא ניתן לפתוח את התבנית %s: %s", p.name, e)
         return DocxDocument(), False
+
+    def _template_source(self, doc_type: str) -> Any:
+        """
+        התבנית ל-docxtpl כ-BytesIO (הקובץ נקרא מיד ולא נשאר נעול).
+        תבנית נעולה/פגומה או חסרה -> מסמך ריק בזיכרון, כמו ב-_open_template.
+        """
+        for name in (f"{doc_type}.docx", "base.docx"):
+            p = self.templates_dir / name
+            if p.is_file():
+                try:
+                    data = p.read_bytes()
+                    if zipfile.is_zipfile(io.BytesIO(data)):
+                        return io.BytesIO(data)
+                    logger.warning("התבנית %s אינה קובץ docx תקין", p.name)
+                except OSError as e:  # למשל קובץ פתוח ב-Word / נעול ע"י OneDrive
+                    logger.warning("לא ניתן לקרוא את התבנית %s: %s", p.name, e)
+        buf = io.BytesIO()
+        DocxDocument().save(buf)
+        buf.seek(0)
+        return buf
 
     # ------------------------------------------------------------------
     # Markdown -> Word
@@ -247,6 +303,12 @@ def _add_table(doc: Any, lines: List[str]) -> None:
         [c.strip() for c in line.strip().strip("|").split("|")]
         for line in lines if not _TABLE_SEP_RE.match(line.strip())
     ]
+    _add_table_rows(doc, rows)
+
+
+def _add_table_rows(doc: Any, rows: List[List[str]]) -> None:
+    """טבלת Word מרשימת שורות (השורה הראשונה מודגשת כשורת כותרת)."""
+    rows = [r for r in rows if r]
     if not rows:
         return
     cols = max(len(r) for r in rows)
@@ -303,6 +365,146 @@ def _replace_placeholders(doc: Any, values: Dict[str, str], keep: set) -> None:
             p.runs[0].text = new
             for r in p.runs[1:]:
                 r.text = ""
+
+
+def _promote_body_anchor(doc: Any) -> bool:
+    """
+    הופך פסקת {{body}} בתבנית ל-{{p body}} - התחביר של docxtpl להזרקת Subdoc
+    במקום פסקה שלמה. כך אותה base.docx משמשת גם את build וגם את build_from_html.
+    """
+    for p in doc.paragraphs:
+        if re.search(r"\{\{\s*(?:p\s+)?body\s*\}\}", p.text or ""):
+            if p.runs:
+                p.runs[0].text = "{{p body}}"
+                for r in p.runs[1:]:
+                    r.text = ""
+            else:
+                p.add_run("{{p body}}")
+            return True
+    return False
+
+
+class _HtmlToDocx(HTMLParser):
+    """
+    ממיר HTML פשוט (הפלט של עורך הטיוטה בממשק) לפסקאות Word מימין לשמאל.
+
+    נתמך: h1-h4, p/div, br, b/strong, i/em, u, ul/ol/li, table/tr/td/th, blockquote.
+    תגיות לא מוכרות - רק הטקסט שבתוכן נשמר; script/style מושמטים לגמרי.
+    """
+
+    _BLOCKS = {"p", "div", "h1", "h2", "h3", "h4", "li", "blockquote", "pre"}
+    _HEADINGS = {"h1": "Heading 1", "h2": "Heading 2", "h3": "Heading 3", "h4": "Heading 3"}
+
+    def __init__(self, doc: Any):
+        super().__init__(convert_charrefs=True)
+        self.doc = doc
+        self.runs: List[tuple] = []  # (text, bold, italic, underline)
+        self.style: Optional[str] = None
+        self.lists: List[str] = []  # מחסנית ul/ol
+        self.fmt = {"b": 0, "i": 0, "u": 0}
+        self.skip = 0
+        self.table: Optional[List[List[str]]] = None
+        self.cell: Optional[List[str]] = None
+
+    # --- בלוקים ---
+    def _flush(self) -> None:
+        runs = [list(r) for r in self.runs]
+        # רווחים בקצוות הפסקה (כולל Runs שהם רק רווח/שבירת שורה) מוסרים
+        while runs and not runs[0][0].strip():
+            runs.pop(0)
+        while runs and not runs[-1][0].strip():
+            runs.pop()
+        if runs:
+            runs[0][0] = runs[0][0].lstrip()
+            runs[-1][0] = runs[-1][0].rstrip()
+            try:
+                p = self.doc.add_paragraph(style=self.style) if self.style else self.doc.add_paragraph()
+            except KeyError:  # סגנון שלא קיים בתבנית -> פסקה רגילה
+                p = self.doc.add_paragraph()
+            _make_rtl(p)
+            for t, b, it, u in runs:
+                if not t:
+                    continue
+                run = p.add_run(t)
+                run.bold = bool(b) or None
+                run.italic = bool(it) or None
+                run.underline = bool(u) or None
+                rtl = OxmlElement("w:rtl")
+                rtl.set(qn("w:val"), "1")
+                run._r.get_or_add_rPr().append(rtl)
+        self.runs = []
+        self.style = None
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in ("script", "style"):
+            self.skip += 1
+        elif tag in ("b", "strong"):
+            self.fmt["b"] += 1
+        elif tag in ("i", "em"):
+            self.fmt["i"] += 1
+        elif tag == "u":
+            self.fmt["u"] += 1
+        elif tag == "br":
+            self._text("\n")
+        elif tag in ("ul", "ol"):
+            self._flush()
+            self.lists.append(tag)
+        elif tag == "table":
+            self._flush()
+            self.table = []
+        elif tag == "tr" and self.table is not None:
+            self.table.append([])
+        elif tag in ("td", "th") and self.table is not None:
+            self.cell = []
+        elif tag in self._BLOCKS:
+            self._flush()
+            if tag in self._HEADINGS:
+                self.style = self._HEADINGS[tag]
+            elif tag == "li":
+                self.style = "List Number" if self.lists and self.lists[-1] == "ol" else "List Bullet"
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style"):
+            self.skip = max(0, self.skip - 1)
+        elif tag in ("b", "strong"):
+            self.fmt["b"] = max(0, self.fmt["b"] - 1)
+        elif tag in ("i", "em"):
+            self.fmt["i"] = max(0, self.fmt["i"] - 1)
+        elif tag == "u":
+            self.fmt["u"] = max(0, self.fmt["u"] - 1)
+        elif tag in ("td", "th") and self.table is not None and self.cell is not None:
+            if not self.table:
+                self.table.append([])
+            self.table[-1].append(re.sub(r"\s+", " ", "".join(self.cell)).strip())
+            self.cell = None
+        elif tag == "table" and self.table is not None:
+            _add_table_rows(self.doc, self.table)
+            self.table = None
+        elif tag in ("ul", "ol"):
+            self._flush()
+            if self.lists:
+                self.lists.pop()
+        elif tag in self._BLOCKS:
+            self._flush()
+
+    def handle_data(self, data: str) -> None:
+        if self.skip:
+            return
+        self._text(re.sub(r"\s+", " ", data))
+
+    def _text(self, text: str) -> None:
+        if self.cell is not None:
+            self.cell.append(text)
+        elif self.table is None:
+            self.runs.append((text, self.fmt["b"], self.fmt["i"], self.fmt["u"]))
+
+    def close(self) -> None:
+        """סוגר את הפענוח וכותב טקסט אחרון שלא נסגר בתגית (או טבלה שלא נסגרה)."""
+        super().close()
+        if self.table is not None:
+            _add_table_rows(self.doc, self.table)
+            self.table = None
+        self._flush()
 
 
 def _move_new_content_to_anchor(doc: Any, before_ids: set) -> None:

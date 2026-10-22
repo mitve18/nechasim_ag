@@ -31,6 +31,8 @@ import mimetypes
 import os
 import re
 import secrets
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -73,7 +75,7 @@ TOOL_STATUS = {
     "get_index_status": "◉ בודק סטטוס אינדקס…",
     "list_document_templates": "📂 מחפש תבניות…",
     "generate_document_from_template": "📝 ממלא תבנית Word…",
-    "generate_word_document": "📝 מפיק מסמך Word…",
+    "draft_document_html": "📝 מכין טיוטה…",
 }
 
 _FOCUS_RE = re.compile(r"^\[מיקוד: [^\]]+\]\n")
@@ -94,6 +96,8 @@ async def lifespan(app: FastAPI):
     STATE.update(drive=drive, rag=rag, docx=docx, templates=templates,
                  agent=build_agent(settings, rag, docx, templates))
     logger.info("השירותים אותחלו בהצלחה")
+    # רישום/חידוש ערוץ ההתראות של הדרייב ברקע - לא מעכב את עליית השרת (Health Check)
+    threading.Thread(target=_ensure_watch, name="drive-watch", daemon=True).start()
     yield
     rag.engine.dispose()
 
@@ -135,6 +139,14 @@ class DocRequest(BaseModel):
 
     markdown: str = Field(..., min_length=1, max_length=60000)
     title: str = Field("תשובת סוכן החוזים", max_length=200)
+
+
+class HtmlDocRequest(BaseModel):
+    """שלב 2 באשף המסמכים: הטיוטה הסופית שהמשתמש ערך (HTML) -> Word."""
+
+    html: str = Field(..., min_length=1, max_length=200_000)
+    title: str = Field("מסמך", min_length=1, max_length=200)
+    doc_type: str = Field("free", pattern=r"^[\w\-]{1,60}$")  # שם תבנית בלבד - ללא תווי נתיב
 
 
 # ======================================================================
@@ -233,6 +245,12 @@ def chat_stream(req: ChatRequest) -> StreamingResponse:
                     yield line({"type": "status", "text": TOOL_STATUS.get(name, "⚙ מעבד…")})
                 elif kind == RunEvent.tool_call_completed.value and getattr(ev, "tool", None):
                     tools.append(ev.tool)
+                    if ev.tool.tool_name == "draft_document_html":
+                        args = ev.tool.tool_args or {}
+                        if str(args.get("content") or "").strip():
+                            # הטיוטה עוברת לממשק ישירות מארגומנטי הכלי - נפתחת שם בעורך
+                            yield line({"type": "draft", "title": args.get("title") or "מסמך",
+                                        "content": args["content"], "doc_type": args.get("doc_type") or "free"})
                 elif kind == RunEvent.run_completed.value:
                     usage = _usage(getattr(ev, "metrics", None))
                     logger.info("chat(stream) tokens=%s cached=%s", usage["tokens"], usage["cached_tokens"])
@@ -439,7 +457,8 @@ def delete_file(file_id: str) -> Dict[str, str]:
 def _run_sync() -> None:
     """מריץ Delta Sync ושומר את הסיכום האחרון כדי שהממשק יוכל להציג אותו."""
     try:
-        summary = STATE["rag"].delta_sync()
+        # קבצים שמאונדקסים עכשיו מהעלאה בממשק לא נשלחים שוב לאינדוקס מקביל
+        summary = STATE["rag"].delta_sync(skip_ids=set(STATE["indexing"]))
     except Exception as e:  # noqa: BLE001
         logger.exception("הסנכרון נכשל")
         summary = {"status": "error", "message": str(e)[:300]}
@@ -459,7 +478,92 @@ def nightly_sync(background: BackgroundTasks, x_sync_secret: str = Header(defaul
     if not secrets.compare_digest(x_sync_secret, settings.SYNC_JOB_SECRET):
         raise HTTPException(401, "סוד סנכרון שגוי")
     background.add_task(_run_sync)
+    background.add_task(_ensure_watch)  # ה-Cron הלילי מחדש גם את ערוץ ההתראות לפני שיפוג
     return {"status": "started"}
+
+
+# ======================================================================
+# סנכרון בזמן אמת: Google Drive Push Notifications
+# ======================================================================
+_webhook_lock = threading.Lock()
+_webhook_state = {"running": False, "pending": False}
+
+
+def _ensure_watch() -> None:
+    """
+    דואג שיהיה ערוץ התראות פעיל מהדרייב אל /api/webhooks/drive.
+
+    ערוץ חדש נפתח רק אם אין ערוץ שמור או שתוקפו מסתיים בתוך 24 שעות (אז הישן מבוטל).
+    בלי PUBLIC_BASE_URL (פיתוח מקומי) - לא נרשמים, ונשארים עם סנכרון לילי + ידני.
+    """
+    base = (settings.PUBLIC_BASE_URL or "").rstrip("/")
+    if not base.startswith("https://"):
+        logger.info("PUBLIC_BASE_URL לא מוגדר (או לא HTTPS) - התראות דרייב בזמן אמת כבויות")
+        return
+    try:
+        rag: RagService = STATE["rag"]
+        current = rag.get_watch()
+        if current and current["expiration"] - time.time() * 1000 > 24 * 3600 * 1000:
+            return
+        watch = STATE["drive"].start_changes_watch(
+            f"{base}/api/webhooks/drive", settings.webhook_token, ttl_hours=settings.DRIVE_WATCH_TTL_HOURS)
+        rag.save_watch(watch)
+        if current:
+            STATE["drive"].stop_watch(current["channel_id"], current["resource_id"])
+        logger.info("ערוץ התראות דרייב נרשם עד %s",
+                    datetime.fromtimestamp(watch["expiration"] / 1000, timezone.utc).isoformat())
+    except Exception:  # noqa: BLE001 - בלי Webhook המערכת ממשיכה לעבוד עם סנכרון לילי + ידני
+        logger.exception("רישום ערוץ התראות הדרייב נכשל")
+
+
+def _request_sync() -> None:
+    """
+    מאחד "גל" של התראות לסנכרון אחד (Debounce) ולא מאבד שינויים.
+
+    - הקריאה הראשונה ממתינה WEBHOOK_DEBOUNCE_SECONDS (העלאה אחת מייצרת כמה התראות),
+      ואז מריצה Delta Sync. קריאות נוספות בזמן ההמתנה/הריצה רק מסמנות pending.
+    - אם הגיעו התראות בזמן שהסנכרון רץ - מריצים בדיוק סבב נוסף אחד בסופו.
+    """
+    with _webhook_lock:
+        if _webhook_state["running"]:
+            _webhook_state["pending"] = True
+            return
+        _webhook_state["running"] = True
+    try:
+        while True:
+            time.sleep(settings.WEBHOOK_DEBOUNCE_SECONDS)
+            with _webhook_lock:
+                _webhook_state["pending"] = False
+            _run_sync()
+            with _webhook_lock:
+                if not _webhook_state["pending"]:
+                    _webhook_state["running"] = False
+                    return
+    except BaseException:
+        with _webhook_lock:
+            _webhook_state["running"] = False
+        raise
+
+
+@app.post("/api/webhooks/drive")
+def drive_webhook(
+    background: BackgroundTasks,
+    x_goog_channel_token: str = Header(default=""),
+    x_goog_resource_state: str = Header(default=""),
+) -> Dict[str, str]:
+    """
+    מקבל התראות Push מ-Google Drive ומחזיר 200 מיד; הסנכרון רץ ברקע.
+
+    - טוקן שגוי -> 200 בלי פעולה (Google מנסה שוב על כל קוד שאינו 2xx, וזה רק היה מציף).
+    - resource_state=sync -> הודעת אימות בפתיחת הערוץ, אין מה לסנכרן.
+    """
+    if not secrets.compare_digest(x_goog_channel_token, settings.webhook_token):
+        logger.warning("התראת דרייב עם טוקן שגוי - התעלמות")
+        return {"status": "ignored"}
+    if x_goog_resource_state == "sync":
+        return {"status": "ok"}
+    background.add_task(_request_sync)
+    return {"status": "queued"}
 
 
 @app.post("/api/files/refresh", status_code=202)
@@ -485,6 +589,16 @@ def sync_status() -> Dict[str, Any]:
 def export_doc(req: DocRequest) -> Dict[str, Any]:
     """ממיר תשובה קיימת (Markdown) למסמך Word מהתבנית המוסדית - ללא LLM."""
     return STATE["docx"].build(req.title, req.markdown)
+
+
+@app.post("/api/docs/export-html")
+def export_html_doc(req: HtmlDocRequest) -> Dict[str, Any]:
+    """שמירת הטיוטה הערוכה מאשף המסמכים ל-Word (תבנית docxtpl) - ללא LLM."""
+    try:
+        return STATE["docx"].build_from_html(req.title, req.html, doc_type=req.doc_type)
+    except Exception as e:  # noqa: BLE001 - תבנית פגומה וכו' -> הודעה ברורה בממשק
+        logger.exception("ייצוא טיוטה ל-Word נכשל")
+        raise HTTPException(500, f"יצירת מסמך ה-Word נכשלה: {str(e)[:300]}") from e
 
 
 @app.get("/api/docs/{name}")

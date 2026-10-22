@@ -34,6 +34,9 @@ services:
         sync: false
       - key: SYNC_JOB_SECRET
         generateValue: true                # Render מייצר סוד אקראי
+      # סנכרון בזמן אמת (Drive Webhook): השרת נרשם בעלייה ל-changes.watch עם הכתובת
+      # $RENDER_EXTERNAL_URL/api/webhooks/drive (Render מגדיר אותה אוטומטית). לדומיין מותאם
+      # אפשר להגדיר PUBLIC_BASE_URL ידנית. ה-Cron הלילי מחדש את הערוץ לפני שיפוג.
 
   - type: cron
     name: contracts-nightly-sync

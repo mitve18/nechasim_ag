@@ -350,6 +350,9 @@
             if (!renderTimer) renderTimer = setTimeout(flush, 80);
           } else if (ev.type === "status") {
             setBotStatus(bubble, ev.text);
+          } else if (ev.type === "draft") {
+            attachDraft(bubble, ev);
+            openDraft(bubble);
           } else if (ev.type === "done") {
             done = ev;
           } else if (ev.type === "error") {
@@ -492,18 +495,118 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ markdown: md, title: title.slice(0, 200) }),
         });
-        const a = document.createElement("a");
-        a.href = doc.download_url;
-        a.download = doc.file_name;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        toast(doc.drive_link ? "המסמך הורד וגובה לדרייב" : "המסמך הורד");
+        downloadDoc(doc);
+      } else if (action === "draft") {
+        openDraft(bubble);
       }
     } catch (err) {
       toast(err.message || "הפעולה נכשלה", 6000);
     } finally {
       btn.disabled = false;
+    }
+  });
+
+  /** מוריד מסמך Word שהשרת יצר ({download_url, file_name, drive_link?}). */
+  function downloadDoc(doc) {
+    const a = document.createElement("a");
+    a.href = doc.download_url;
+    a.download = doc.file_name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    toast(doc.drive_link ? "המסמך הורד וגובה לדרייב" : "המסמך הורד");
+  }
+
+  // ======================================================================
+  // אשף מסמכים: טיוטה מהסוכן -> עריכה בעורך -> שמירה ל-Word (0 טוקנים)
+  // ======================================================================
+  const drafts = new WeakMap(); // בועה -> {title, html, doc_type} (כולל עריכות המשתמש)
+  const draftEls = {
+    dialog: $("#draftDialog"),
+    title: $("#draftTitle"),
+    editor: $("#draftEditor"),
+    save: $("#draftSave"),
+    cancel: $("#draftCancel"),
+  };
+  let draftBubble = null;
+
+  /** שומר את הטיוטה על הבועה ומוסיף לה כפתור "פתח טיוטה" (לפתיחה חוזרת אחרי סגירה). */
+  function attachDraft(bubble, ev) {
+    drafts.set(bubble, {
+      title: ev.title || "מסמך",
+      html: renderMarkdown(ev.content || ""), // marked מעביר HTML כמו שהוא; DOMPurify מסנן
+      doc_type: ev.doc_type || "free",
+    });
+    const actions = bubble.querySelector(".msg-actions");
+    if (!actions.querySelector('[data-msg-action="draft"]')) {
+      actions.insertAdjacentHTML(
+        "afterbegin",
+        `<button class="icon-btn" data-msg-action="draft" title="פתיחת הטיוטה לעריכה"><i class="icon-file-pen-line"></i></button>`,
+      );
+    }
+  }
+
+  function openDraft(bubble) {
+    const d = drafts.get(bubble);
+    if (!d) return;
+    draftBubble = bubble;
+    draftEls.title.value = d.title;
+    draftEls.editor.innerHTML = d.html;
+    if (!draftEls.dialog.open) draftEls.dialog.showModal();
+    draftEls.editor.focus();
+  }
+
+  /** שומר את העריכות בזיכרון, כך שסגירה ופתיחה מחדש לא מאבדות שינויים. */
+  function keepDraftEdits() {
+    const d = draftBubble && drafts.get(draftBubble);
+    if (!d) return;
+    d.title = draftEls.title.value.trim() || d.title;
+    d.html = draftEls.editor.innerHTML;
+  }
+
+  draftEls.dialog.addEventListener("close", keepDraftEdits);
+  draftEls.cancel.addEventListener("click", () => draftEls.dialog.close());
+
+  // סרגל כלים: execCommand עדיין נתמך בכל הדפדפנים ומספיק לעיצוב בסיסי של מכתב
+  draftEls.dialog.querySelector(".draft-toolbar").addEventListener("mousedown", (e) => {
+    const btn = e.target.closest("[data-cmd]");
+    if (!btn) return;
+    e.preventDefault(); // לא לגנוב את הפוקוס/הבחירה מהעורך
+    document.execCommand(btn.dataset.cmd, false, btn.dataset.arg || null);
+  });
+
+  // הדבקה כטקסט נקי - מונע עיצובים זרים (Word/אתרים) שלא יעברו טוב למסמך
+  draftEls.editor.addEventListener("paste", (e) => {
+    e.preventDefault();
+    const text = e.clipboardData.getData("text/plain");
+    document.execCommand("insertText", false, text);
+  });
+
+  draftEls.save.addEventListener("click", async () => {
+    keepDraftEdits();
+    const d = drafts.get(draftBubble);
+    if (!d) return;
+    const html = window.DOMPurify ? DOMPurify.sanitize(d.html) : d.html;
+    if (!draftEls.editor.innerText.trim()) {
+      toast("הטיוטה ריקה");
+      return;
+    }
+    const original = draftEls.save.innerHTML;
+    draftEls.save.disabled = true;
+    draftEls.save.innerHTML = `<i class="icon-loader-circle spin"></i>שומר…`;
+    try {
+      const doc = await api("/api/docs/export-html", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: d.title.slice(0, 200), html, doc_type: d.doc_type }),
+      });
+      downloadDoc(doc);
+      draftEls.dialog.close();
+    } catch (err) {
+      toast(`השמירה נכשלה: ${err.message}`, 7000);
+    } finally {
+      draftEls.save.disabled = false;
+      draftEls.save.innerHTML = original;
     }
   });
 
