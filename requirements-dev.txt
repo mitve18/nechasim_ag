@@ -1,6 +1,0 @@
-# ===== חבילות לפיתוח ובדיקות בלבד =====
-# לא להוסיף ל-requirements.txt - Render מתקין רק אותו, וחבילות אלה מיותרות בייצור.
-# התקנה: pip install -r requirements-dev.txt
-
-# בדיקות עומסים (locustfile.py בשורש הפרויקט)
-locust>=2.32
