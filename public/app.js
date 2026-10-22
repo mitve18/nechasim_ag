@@ -8,7 +8,7 @@
     3. דוחות מהירים: /api/reports/{kind} - SQL ישיר, 0 טוקנים.
     4. פעולות על תשובה: העתקה, העתקת טבלה לאקסל, ייצוא ל-Word, צ'יפים של מקורות.
     5. קבצים: רשימה, כרטיס חוזה (מטא-דאטה מקומי), מיקוד בחוזה, העלאה עם התקדמות, מחיקה.
-    6. סנכרון ידני וערכת נושא.
+    6. סנכרון ידני.
 
   חיסכון בטוקנים בצד הלקוח:
     - session_id קבוע לשיחה: השרת טוען רק את הסבבים האחרונים + סיכום, ולא כל ההיסטוריה.
@@ -21,13 +21,24 @@
 
   // ---------- עזרי אחסון (localStorage עלול להיות חסום - לכן try/catch) ----------
   const store = {
-    get(key) { try { return localStorage.getItem(key); } catch (_) { return null; } },
-    set(key, val) { try { localStorage.setItem(key, val); } catch (_) {} },
+    get(key) {
+      try {
+        return localStorage.getItem(key);
+      } catch (_) {
+        return null;
+      }
+    },
+    set(key, val) {
+      try {
+        localStorage.setItem(key, val);
+      } catch (_) {}
+    },
   };
 
   const $ = (sel) => document.querySelector(sel);
   const els = {
-    messages: $("#messages"),
+    messages: $("#messages"), // אזור הגלילה
+    list: $("#messageList"), // רשימת הבועות בתוך אזור הגלילה
     emptyTpl: $("#emptyStateTpl"),
     form: $("#chatForm"),
     input: $("#chatInput"),
@@ -37,12 +48,12 @@
     fileList: $("#fileList"),
     fileCount: $("#fileCount"),
     fileInput: $("#fileInput"),
-    dropZone: $("#dropZone"),
+    uploadBtn: $("#uploadBtn"),
+    sidebar: $("#sidebar"),
     fileSearch: $("#fileSearch"),
     uploadProgress: $("#uploadProgress"),
     syncBtn: $("#syncBtn"),
     syncInfo: $("#syncInfo"),
-    themeBtn: $("#themeBtn"),
     newChatBtn: $("#newChatBtn"),
     toast: $("#toast"),
     dialog: $("#fileDialog"),
@@ -78,7 +89,11 @@
   // עזרים כלליים
   // ======================================================================
   function newSessionId() {
-    const id = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()).replace(/-/g, "");
+    const id = (
+      crypto.randomUUID
+        ? crypto.randomUUID()
+        : String(Date.now()) + Math.random()
+    ).replace(/-/g, "");
     store.set("session_id", id);
     return id;
   }
@@ -87,7 +102,9 @@
   async function api(path, options = {}) {
     const res = await fetch(path, options);
     let data = null;
-    try { data = await res.json(); } catch (_) {}
+    try {
+      data = await res.json();
+    } catch (_) {}
     if (!res.ok) throw new Error(errorDetail(data, res.status));
     return data;
   }
@@ -103,7 +120,9 @@
     els.toast.textContent = text;
     els.toast.hidden = false;
     clearTimeout(toast._t);
-    toast._t = setTimeout(() => { els.toast.hidden = true; }, ms);
+    toast._t = setTimeout(() => {
+      els.toast.hidden = true;
+    }, ms);
   }
 
   /** ממיר Markdown ל-HTML בטוח (DOMPurify מונע הזרקת סקריפטים מתשובות המודל). */
@@ -113,7 +132,17 @@
   }
 
   function escapeHtml(s) {
-    return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    return String(s ?? "").replace(
+      /[&<>"']/g,
+      (c) =>
+        ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[c],
+    );
   }
 
   function formatSize(bytes) {
@@ -125,7 +154,11 @@
   // ======================================================================
   // גלילה חכמה: גוללים למטה רק אם המשתמש כבר היה בתחתית
   // ======================================================================
-  const nearBottom = () => els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight < 80;
+  const nearBottom = () =>
+    els.messages.scrollHeight -
+      els.messages.scrollTop -
+      els.messages.clientHeight <
+    80;
 
   /** מריץ עדכון DOM ושומר על "הדבקה לתחתית" רק אם המשתמש היה שם לפני העדכון. */
   function withScroll(update) {
@@ -135,9 +168,14 @@
     else els.jump.hidden = false;
   }
 
-  els.messages.addEventListener("scroll", () => { if (nearBottom()) els.jump.hidden = true; });
+  els.messages.addEventListener("scroll", () => {
+    if (nearBottom()) els.jump.hidden = true;
+  });
   els.jump.addEventListener("click", () => {
-    els.messages.scrollTo({ top: els.messages.scrollHeight, behavior: "smooth" });
+    els.messages.scrollTo({
+      top: els.messages.scrollHeight,
+      behavior: "smooth",
+    });
     els.jump.hidden = true;
   });
 
@@ -145,12 +183,12 @@
   // בועות הודעה
   // ======================================================================
   function showEmptyState() {
-    els.messages.innerHTML = "";
-    els.messages.appendChild(els.emptyTpl.content.cloneNode(true));
+    els.list.innerHTML = "";
+    els.list.appendChild(els.emptyTpl.content.cloneNode(true));
   }
 
   function clearEmptyState() {
-    const empty = els.messages.querySelector(".empty-state");
+    const empty = els.list.querySelector(".empty-state");
     if (empty) empty.remove();
   }
 
@@ -161,14 +199,20 @@
     if (focus) {
       const tag = document.createElement("span");
       tag.className = "msg-focus";
-      tag.textContent = `📎 ${focus}`;
+      tag.innerHTML = `<i class="icon-paperclip"></i>`;
+      tag.appendChild(document.createTextNode(focus));
       div.appendChild(tag);
     }
-    div.appendChild(document.createTextNode(text));
-    els.messages.appendChild(div);
+    const body = document.createElement("div");
+    body.className = "msg-user-text";
+    body.textContent = text;
+    div.appendChild(body);
+    els.list.appendChild(div);
     els.messages.scrollTop = els.messages.scrollHeight; // הודעה של המשתמש עצמו - תמיד גוללים
     return div;
   }
+
+  const DEFAULT_STATUS = "מחפש בחוזים…";
 
   /** יוצר בועת סוכן ריקה עם אזורי סטטוס, תוכן, מקורות ופעולות. */
   function addBotMessage() {
@@ -176,18 +220,18 @@
     const div = document.createElement("div");
     div.className = "msg msg-bot";
     div.innerHTML = `
-      <div class="msg-status"><span class="typing"><i></i><i></i><i></i></span><span class="status-text"></span></div>
+      <div class="msg-status"><span class="typing"><i></i><i></i><i></i></span><span class="status-text">${DEFAULT_STATUS}</span></div>
       <div class="msg-body"></div>
       <div class="msg-sources"></div>
       <div class="msg-footer" hidden>
-        <span class="tokens"></span>
         <div class="msg-actions">
-          <button class="icon-btn" data-msg-action="copy" title="העתקה">⧉ העתק</button>
-          <button class="icon-btn" data-msg-action="table" title="העתקת הטבלה להדבקה באקסל" hidden>▦ העתק טבלה</button>
-          <button class="icon-btn" data-msg-action="word" title="ייצוא למסמך Word (ללא עלות טוקנים)">⇩ Word</button>
+          <button class="icon-btn" data-msg-action="copy" title="העתקה"><i class="icon-copy"></i></button>
+          <button class="icon-btn" data-msg-action="table" title="העתקת טבלה לאקסל" hidden><i class="icon-sheet"></i></button>
+          <button class="icon-btn" data-msg-action="word" title="ייצוא ל-Word (ללא עלות טוקנים)"><i class="icon-file-down"></i></button>
         </div>
+        <span class="tokens"></span>
       </div>`;
-    withScroll(() => els.messages.appendChild(div));
+    withScroll(() => els.list.appendChild(div));
     return div;
   }
 
@@ -197,30 +241,48 @@
     st.querySelector(".status-text").textContent = text || "";
   }
 
+  function setBotError(bubble, message) {
+    bubble.classList.add("msg-error");
+    const st = bubble.querySelector(".msg-status");
+    st.hidden = false;
+    st.innerHTML = `<i class="icon-circle-alert"></i><span class="status-text">שגיאה: ${escapeHtml(message)}</span>`;
+  }
+
   function setBotBody(bubble, md) {
     rawMarkdown.set(bubble, md);
-    withScroll(() => { bubble.querySelector(".msg-body").innerHTML = renderMarkdown(md); });
+    withScroll(() => {
+      bubble.querySelector(".msg-body").innerHTML = renderMarkdown(md);
+    });
   }
 
   /** סוגר בועה: מסתיר סטטוס, מציג מקורות, טוקנים וכפתורי פעולה. */
-  function finishBotMessage(bubble, { tokens, cached_tokens, sources, note } = {}) {
+  function finishBotMessage(
+    bubble,
+    { tokens, cached_tokens, sources, note } = {},
+  ) {
     bubble.querySelector(".msg-status").hidden = true;
     const src = bubble.querySelector(".msg-sources");
-    src.innerHTML = (sources || []).map((s) => {
-      const label = `📄 ${escapeHtml(s.file)}${s.sections && s.sections.length ? ` · ${escapeHtml(s.sections.join(", "))}` : ""}`;
-      return s.link
-        ? `<a class="source-chip" href="${escapeHtml(s.link)}" target="_blank" rel="noopener" title="פתח בדרייב">${label}</a>`
-        : `<span class="source-chip">${label}</span>`;
-    }).join("");
+    src.innerHTML = (sources || [])
+      .map((s) => {
+        const label = `<i class="icon-file-text"></i>${escapeHtml(s.file)}${s.sections && s.sections.length ? ` · ${escapeHtml(s.sections.join(", "))}` : ""}`;
+        return s.link
+          ? `<a class="source-chip" href="${escapeHtml(s.link)}" target="_blank" rel="noopener" title="פתח בדרייב">${label}</a>`
+          : `<span class="source-chip">${label}</span>`;
+      })
+      .join("");
 
     const footer = bubble.querySelector(".msg-footer");
     const t = footer.querySelector(".tokens");
     if (note) t.textContent = note;
     else if (tokens) {
-      t.textContent = `${tokens.toLocaleString("he-IL")} טוקנים` +
-        (cached_tokens ? ` (${cached_tokens.toLocaleString("he-IL")} מהמטמון)` : "");
+      t.textContent =
+        `${tokens.toLocaleString("he-IL")} טוקנים` +
+        (cached_tokens
+          ? ` (${cached_tokens.toLocaleString("he-IL")} מהמטמון)`
+          : "");
     }
-    footer.querySelector('[data-msg-action="table"]').hidden = !bubble.querySelector(".msg-body table");
+    footer.querySelector('[data-msg-action="table"]').hidden =
+      !bubble.querySelector(".msg-body table");
     footer.hidden = !rawMarkdown.get(bubble);
     withScroll(() => {});
   }
@@ -230,9 +292,12 @@
   // ======================================================================
   function setBusy(value) {
     busy = value;
-    els.send.textContent = value ? "■ עצור" : "שליחה";
+    els.send.innerHTML = `<i class="${value ? "icon-square" : "icon-arrow-up"}"></i>`;
+    els.send.title = value ? "עצור" : "שליחה";
     els.send.classList.toggle("btn-stop", value);
-    document.querySelectorAll(".chip, .example").forEach((b) => { b.disabled = value; });
+    document.querySelectorAll(".chip").forEach((b) => {
+      b.disabled = value;
+    });
   }
 
   // ======================================================================
@@ -246,7 +311,10 @@
     let text = "";
     let renderTimer = null;
     let done = null;
-    const flush = () => { renderTimer = null; setBotBody(bubble, text); };
+    const flush = () => {
+      renderTimer = null;
+      setBotBody(bubble, text);
+    };
 
     try {
       const res = await fetch("/api/chat/stream", {
@@ -257,7 +325,9 @@
       });
       if (!res.ok) {
         let data = null;
-        try { data = await res.json(); } catch (_) {}
+        try {
+          data = await res.json();
+        } catch (_) {}
         throw new Error(errorDetail(data, res.status));
       }
       const reader = res.body.getReader();
@@ -297,10 +367,7 @@
         finishBotMessage(bubble, { note: "התשובה נעצרה" });
       } else {
         if (text) setBotBody(bubble, text);
-        bubble.classList.add("msg-error");
-        const st = bubble.querySelector(".msg-status");
-        st.hidden = false;
-        st.innerHTML = `<span class="status-text">שגיאה: ${escapeHtml(err.message)}</span>`;
+        setBotError(bubble, err.message);
       }
     } finally {
       controller = null;
@@ -316,7 +383,10 @@
 
   els.form.addEventListener("submit", (e) => {
     e.preventDefault();
-    if (busy) { if (controller) controller.abort(); return; } // הכפתור משמש כ"עצור"
+    if (busy) {
+      if (controller) controller.abort();
+      return;
+    } // הכפתור משמש כ"עצור"
     const text = els.input.value.trim();
     if (!text) return;
     els.input.value = "";
@@ -338,22 +408,22 @@
   }
   els.input.addEventListener("input", autoGrow);
 
-  els.messages.addEventListener("click", (e) => {
-    const ex = e.target.closest(".example");
-    if (ex && !busy) sendMessage(ex.textContent.trim());
-  });
-
   // ======================================================================
   // דוחות מהירים (SQL, 0 טוקנים) ואנליזת LLM
   // ======================================================================
-  const mdCell = (v) => String(v ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
+  const mdCell = (v) =>
+    String(v ?? "")
+      .replace(/\|/g, "\\|")
+      .replace(/\n/g, " ");
 
   /** ממיר דוח {title, columns, rows} לטבלת Markdown - כך העתקה וייצוא ל-Word עובדים גם עליו. */
   function reportToMarkdown(r) {
     let md = `### ${r.title}\n\n`;
     if (r.rows && r.rows.length) {
       md += `| ${r.columns.map(mdCell).join(" | ")} |\n| ${r.columns.map(() => "---").join(" | ")} |\n`;
-      md += r.rows.map((row) => `| ${row.map(mdCell).join(" | ")} |`).join("\n");
+      md += r.rows
+        .map((row) => `| ${row.map(mdCell).join(" | ")} |`)
+        .join("\n");
     }
     if (r.note) md += `\n\n${r.note}`;
     return md;
@@ -370,8 +440,7 @@
         setBotBody(bubble, reportToMarkdown(report));
         finishBotMessage(bubble, { note: "0 טוקנים · ישירות ממסד הנתונים" });
       } catch (err) {
-        bubble.classList.add("msg-error");
-        bubble.querySelector(".msg-status").innerHTML = `<span class="status-text">שגיאה: ${escapeHtml(err.message)}</span>`;
+        setBotError(bubble, err.message);
       } finally {
         setBusy(false);
       }
@@ -398,15 +467,26 @@
     try {
       if (action === "copy") {
         await navigator.clipboard.writeText(md);
-        toast("התשובה הועתקה");
+        const icon = btn.querySelector("i");
+        icon.className = "icon-check";
+        setTimeout(() => {
+          icon.className = "icon-copy";
+        }, 1400);
       } else if (action === "table") {
         const table = bubble.querySelector(".msg-body table");
-        const tsv = [...table.rows].map((r) => [...r.cells].map((c) => c.innerText.replace(/\s+/g, " ").trim()).join("\t")).join("\n");
+        const tsv = [...table.rows]
+          .map((r) =>
+            [...r.cells]
+              .map((c) => c.innerText.replace(/\s+/g, " ").trim())
+              .join("\t"),
+          )
+          .join("\n");
         await navigator.clipboard.writeText(tsv);
         toast("הטבלה הועתקה - אפשר להדביק באקסל");
       } else if (action === "word") {
         btn.disabled = true;
-        const title = (md.match(/^#+\s+(.+)$/m) || [])[1] || "תשובת סוכן החוזים";
+        const title =
+          (md.match(/^#+\s+(.+)$/m) || [])[1] || "תשובת סוכן החוזים";
         const doc = await api("/api/docs", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -434,12 +514,15 @@
     focusFile = name || null;
     els.focusBar.hidden = !focusFile;
     els.focusBar.innerHTML = focusFile
-      ? `<span class="focus-chip">📎 שאלות על: <b>${escapeHtml(focusFile)}</b>
-           <button type="button" class="focus-clear" aria-label="ביטול מיקוד">✕</button></span>`
+      ? `<span class="focus-chip"><i class="icon-paperclip"></i><span>${escapeHtml(focusFile)}</span>
+           <button type="button" class="focus-clear" aria-label="ביטול מיקוד"><i class="icon-x"></i></button></span>`
       : "";
     if (focusFile) els.input.focus();
+    renderFiles(); // מסמן את החוזה הממוקד ברשימה
   }
-  els.focusBar.addEventListener("click", (e) => { if (e.target.closest(".focus-clear")) setFocus(null); });
+  els.focusBar.addEventListener("click", (e) => {
+    if (e.target.closest(".focus-clear")) setFocus(null);
+  });
 
   // ======================================================================
   // שיחה חדשה ושחזור שיחה
@@ -455,9 +538,14 @@
   /** משחזר את הודעות השיחה מהשרת אחרי רענון הדף (קריאה מ-Postgres, ללא LLM). */
   async function restoreSession() {
     try {
-      const { messages } = await api(`/api/sessions/${encodeURIComponent(sessionId)}/messages`);
-      if (!messages || !messages.length) { showEmptyState(); return; }
-      els.messages.innerHTML = "";
+      const { messages } = await api(
+        `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
+      );
+      if (!messages || !messages.length) {
+        showEmptyState();
+        return;
+      }
+      els.list.innerHTML = "";
       for (const m of messages) {
         if (m.role === "user") addUserMessage(m.content, m.focus);
         else {
@@ -487,12 +575,13 @@
       clearTimeout(pollTimer);
       if (inProgress) pollTimer = setTimeout(loadFiles, 5000);
     } catch (err) {
-      els.fileList.innerHTML = `<li class="muted small">${escapeHtml(err.message)}</li>`;
+      els.fileList.innerHTML = `<li class="file-empty">${escapeHtml(err.message)}</li>`;
     }
   }
 
   function statusLabel(f) {
-    if (f.status === "error" && f.retries >= maxRetries) return "נכשל - דורש בדיקה";
+    if (f.status === "error" && f.retries >= maxRetries)
+      return "נכשל - דורש בדיקה";
     return STATUS_LABELS[f.status] || f.status;
   }
 
@@ -502,43 +591,70 @@
     const visible = files.filter((f) => !q || f.name.toLowerCase().includes(q));
     els.fileCount.textContent = files.length;
     if (!visible.length) {
-      els.fileList.innerHTML = `<li class="muted small">${files.length ? "אין תוצאות לסינון" : "התיקייה ריקה - העלה חוזה ראשון"}</li>`;
+      els.fileList.innerHTML = `<li class="file-empty">${files.length ? "אין תוצאות לסינון" : "התיקייה ריקה - העלה חוזה ראשון"}</li>`;
       return;
     }
-    els.fileList.innerHTML = visible.map((f) => {
-      const m = f.metadata || {};
-      const metaParts = [m.block_parcel || m.property, m.end_date ? `עד ${m.end_date}` : "", formatSize(f.size)].filter(Boolean);
-      // שגיאה מוצגת בטקסט גלוי (ולא רק ב-tooltip) - כדי שתהיה נגישה גם בנייד
-      const meta = f.status === "error" && f.error
-        ? `<div class="file-meta file-error">${escapeHtml(f.error)}</div>`
-        : `<div class="file-meta">${escapeHtml(metaParts.join(" · ") || (f.extraction ? `פוענח: ${f.extraction}` : ""))}</div>`;
-      return `
-        <li class="file-item" data-id="${escapeHtml(f.id)}">
-          <button class="file-name" data-action="details" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</button>
-          <div class="file-actions">
-            <span class="status status-${escapeHtml(f.status)}">${escapeHtml(statusLabel(f))}</span>
-            <button class="icon-btn" data-action="focus" title="שאל על החוזה הזה">📎</button>
-            <button class="icon-btn danger" data-action="delete" title="מחיקה">🗑</button>
+    els.fileList.innerHTML = visible
+      .map((f) => {
+        const m = f.metadata || {};
+        const metaText = m.end_date
+          ? `עד ${m.end_date}`
+          : m.block_parcel ||
+            m.property ||
+            formatSize(f.size) ||
+            (f.extraction ? `פוענח: ${f.extraction}` : "");
+        // שגיאה מוצגת בטקסט גלוי (ולא רק ב-tooltip) - כדי שתהיה נגישה גם בנייד
+        const isErr = f.status === "error" && f.error;
+        return `
+        <li class="file-item${focusFile === f.name ? " active" : ""}" data-id="${escapeHtml(f.id)}" data-action="focus" title="${escapeHtml(f.name)}">
+          <i class="icon-file-text" aria-hidden="true"></i>
+          <div class="file-body">
+            <div class="file-name">${escapeHtml(f.name)}</div>
+            <div class="file-meta">
+              <span class="status status-${escapeHtml(f.status)}">${escapeHtml(statusLabel(f))}</span>
+              <span class="meta-text${isErr ? " file-error" : ""}" title="${escapeHtml(isErr ? f.error : metaText)}">${escapeHtml(isErr ? f.error : metaText)}</span>
+            </div>
           </div>
-          ${meta}
+          <button class="file-info" type="button" data-action="details" title="כרטיס חוזה" aria-label="כרטיס חוזה"><i class="icon-ellipsis"></i></button>
         </li>`;
-    }).join("");
+      })
+      .join("");
   }
 
   function renderSyncInfo(last) {
-    if (!last) { els.syncInfo.textContent = ""; return; }
-    if (last.status === "error") { els.syncInfo.textContent = `סנכרון אחרון נכשל: ${last.message || ""}`; return; }
-    const when = last.finished_at ? new Date(last.finished_at).toLocaleString("he-IL") : "";
-    els.syncInfo.textContent = `סנכרון אחרון ${when}: ${last.new} חדשים, ${last.updated} עודכנו, ${last.skipped} ללא שינוי, ${last.removed} הוסרו` +
-      `${last.failed ? `, ${last.failed} נכשלו` : ""}${last.gave_up ? `, ${last.gave_up} דורשים בדיקה` : ""}`;
+    if (!last) {
+      els.syncInfo.textContent = "";
+      return;
+    }
+    if (last.status === "error") {
+      els.syncInfo.textContent = `סנכרון אחרון נכשל: ${last.message || ""}`;
+      return;
+    }
+    const when = last.finished_at
+      ? new Date(last.finished_at).toLocaleString("he-IL", {
+          dateStyle: "short",
+          timeStyle: "short",
+        })
+      : "";
+    const parts = [
+      last.new && `${last.new} חדשים`,
+      last.updated && `${last.updated} עודכנו`,
+      last.removed && `${last.removed} הוסרו`,
+      last.failed && `${last.failed} נכשלו`,
+      last.gave_up && `${last.gave_up} דורשים בדיקה`,
+    ].filter(Boolean);
+    els.syncInfo.textContent = `סנכרון אחרון ${when} · ${parts.length ? parts.join(", ") : "ללא שינויים"}`;
   }
 
   els.fileSearch.addEventListener("input", renderFiles);
 
   async function deleteFile(file) {
-    if (!confirm(`להעביר את "${file.name}" לאשפה בדרייב ולהסיר מהאינדקס?`)) return false;
+    if (!confirm(`להעביר את "${file.name}" לאשפה בדרייב ולהסיר מהאינדקס?`))
+      return false;
     try {
-      await api(`/api/files/${encodeURIComponent(file.id)}`, { method: "DELETE" });
+      await api(`/api/files/${encodeURIComponent(file.id)}`, {
+        method: "DELETE",
+      });
       toast("הקובץ הועבר לאשפה");
       if (focusFile === file.name) setFocus(null);
       loadFiles();
@@ -557,10 +673,6 @@
     if (!file) return;
     if (btn.dataset.action === "details") openFileDialog(file);
     if (btn.dataset.action === "focus") setFocus(file.name);
-    if (btn.dataset.action === "delete") {
-      btn.disabled = true;
-      if (!(await deleteFile(file))) btn.disabled = false;
-    }
   });
 
   // ---------- כרטיס חוזה (מטא-דאטה מקומי, 0 טוקנים) ----------
@@ -570,18 +682,28 @@
     dialogFile = file;
     const m = file.metadata || {};
     $("#fdTitle").textContent = file.name;
-    const rows = META_LABELS
-      .map(([k, label]) => [label, Array.isArray(m[k]) ? m[k].join("; ") : m[k]])
-      .filter(([, v]) => v);
+    const rows = META_LABELS.map(([k, label]) => [
+      label,
+      Array.isArray(m[k]) ? m[k].join("; ") : m[k],
+    ]).filter(([, v]) => v);
     rows.push(["סטטוס", statusLabel(file)]);
-    if (file.extraction) rows.push(["פענוח", `${file.extraction}${file.pages ? ` · ${file.pages} עמ'` : ""}`]);
+    if (file.extraction)
+      rows.push([
+        "פענוח",
+        `${file.extraction}${file.pages ? ` · ${file.pages} עמ'` : ""}`,
+      ]);
     if (file.error) rows.push(["שגיאה", file.error]);
-    $("#fdMeta").innerHTML = rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join("")
-      || `<dd class="muted">אין מטא-דאטה - הקובץ עוד לא אונדקס.</dd>`;
+    $("#fdMeta").innerHTML =
+      rows
+        .map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`)
+        .join("") ||
+      `<dd class="muted">אין מטא-דאטה - הקובץ עוד לא אונדקס.</dd>`;
     const link = $("#fdLink");
     link.hidden = !file.link;
     link.href = file.link || "#";
-    $("#fdReindex").hidden = !["error", "pending", "outdated"].includes(file.status);
+    $("#fdReindex").hidden = !["error", "pending", "outdated"].includes(
+      file.status,
+    );
     els.dialog.showModal();
   }
 
@@ -594,7 +716,9 @@
   });
   $("#fdReindex").addEventListener("click", async () => {
     try {
-      await api(`/api/files/${encodeURIComponent(dialogFile.id)}/reindex`, { method: "POST" });
+      await api(`/api/files/${encodeURIComponent(dialogFile.id)}/reindex`, {
+        method: "POST",
+      });
       toast("האינדוקס התחיל ברקע");
       els.dialog.close();
       loadFiles();
@@ -611,10 +735,14 @@
       const fd = new FormData();
       fd.append("file", file);
       xhr.open("POST", "/api/files/upload");
-      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.loaded / e.total);
+      };
       xhr.onload = () => {
         let data = null;
-        try { data = JSON.parse(xhr.responseText); } catch (_) {}
+        try {
+          data = JSON.parse(xhr.responseText);
+        } catch (_) {}
         if (xhr.status >= 200 && xhr.status < 300) resolve(data);
         else reject(new Error(errorDetail(data, xhr.status)));
       };
@@ -634,7 +762,10 @@
       try {
         await uploadOne(file, (p) => {
           bar.style.width = `${Math.round(p * 100)}%`;
-          label.textContent = p < 1 ? `${prefix}מעלה את ${file.name}… ${Math.round(p * 100)}%` : `${prefix}שומר בדרייב…`;
+          label.textContent =
+            p < 1
+              ? `${prefix}מעלה את ${file.name}… ${Math.round(p * 100)}%`
+              : `${prefix}שומר בדרייב…`;
         });
         toast(`${file.name} הועלה - מתבצע אינדוקס ברקע`);
       } catch (err) {
@@ -646,20 +777,26 @@
     els.uploadProgress.hidden = true;
   }
 
+  els.uploadBtn.addEventListener("click", () => els.fileInput.click());
   els.fileInput.addEventListener("change", () => {
     if (els.fileInput.files.length) uploadFiles([...els.fileInput.files]);
     els.fileInput.value = "";
   });
 
-  ["dragenter", "dragover"].forEach((ev) => els.dropZone.addEventListener(ev, (e) => {
+  // גרירת קבצים לכל סרגל הצד
+  ["dragenter", "dragover"].forEach((ev) =>
+    els.sidebar.addEventListener(ev, (e) => {
+      e.preventDefault();
+      els.sidebar.classList.add("dragover");
+    }),
+  );
+  els.sidebar.addEventListener("dragleave", (e) => {
+    if (!els.sidebar.contains(e.relatedTarget))
+      els.sidebar.classList.remove("dragover");
+  });
+  els.sidebar.addEventListener("drop", (e) => {
     e.preventDefault();
-    els.dropZone.classList.add("dragover");
-  }));
-  ["dragleave", "drop"].forEach((ev) => els.dropZone.addEventListener(ev, (e) => {
-    e.preventDefault();
-    els.dropZone.classList.remove("dragover");
-  }));
-  els.dropZone.addEventListener("drop", (e) => {
+    els.sidebar.classList.remove("dragover");
     if (e.dataTransfer.files.length) uploadFiles([...e.dataTransfer.files]);
   });
 
@@ -690,17 +827,6 @@
     } finally {
       els.syncBtn.classList.remove("spinning");
     }
-  });
-
-  // ======================================================================
-  // ערכת נושא
-  // ======================================================================
-  els.themeBtn.addEventListener("click", () => {
-    const current = document.documentElement.dataset.theme
-      || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-    const next = current === "dark" ? "light" : "dark";
-    document.documentElement.dataset.theme = next;
-    store.set("theme", next);
   });
 
   // ---------- אתחול ----------

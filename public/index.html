@@ -2,130 +2,193 @@
 <!--
   index.html - ממשק ה-Web של סוכן החוזים (עברית מלאה, RTL).
 
-  מבנה המסך:
-    - סרגל עליון: שם המערכת, כפתור סנכרון ומתג ערכת נושא (כהה/בהיר).
-    - פאנל צד: רשימת הקבצים בתיקיית החוזים בדרייב, אזור גרירה להעלאה, סטטוס אינדוקס ומחיקה.
-    - פאנל ראשי: צ'אט עם הסוכן (Streaming) + דוחות מהירים + צ'יפ מיקוד בחוזה.
+  מבנה המסך (לפי עיצוב "AI Contract Agent" מ-Claude Design):
+    - סרגל צד: מותג, שיחה חדשה, חיפוש, רשימת החוזים בדרייב, העלאה וסנכרון.
+    - אזור ראשי: צ'אט עם הסוכן (Streaming), צ'יפים של דוחות מהירים ותיבת כתיבה עם מיקוד בחוזה.
     - חלון כרטיס חוזה (dialog): מטא-דאטה, מיקוד, ניסיון אינדוקס חוזר ומחיקה.
 
   הדף סטטי לחלוטין ומוגש ע"י FastAPI מתיקיית public - אין שלב Build ואין צורך
-  בשרת נוסף ב-Render. הספריות היחידות: marked (Markdown) ו-DOMPurify (סינון HTML).
+  בשרת נוסף ב-Render. ספריות: marked (Markdown), DOMPurify (סינון HTML), Lucide (אייקונים).
 -->
 <html lang="he" dir="rtl">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>סוכן חוזים | יחידת נכסים</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css" />
-  <script>
-    // החלת ערכת הנושא לפני הציור הראשון - מונע "הבהוב" של ערכה שגויה
-    try {
-      const t = localStorage.getItem("theme");
-      if (t) document.documentElement.dataset.theme = t;
-    } catch (_) {}
-  </script>
-</head>
-<body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="brand-mark" aria-hidden="true">§</span>
-      <div>
-        <h1>סוכן חוזים והסכמים</h1>
-        <p class="subtitle">יחידת נכסים · MITVE TOOLS - NECHASIM - CONTRACTS</p>
-      </div>
-    </div>
-    <div class="topbar-actions">
-      <button id="syncBtn" class="btn btn-ghost" title="סנכרון Delta מול הדרייב">
-        <span class="icon" aria-hidden="true">⟳</span> סנכרון
-      </button>
-      <button id="newChatBtn" class="btn btn-ghost" title="התחלת שיחה חדשה">שיחה חדשה</button>
-      <button id="themeBtn" class="btn btn-icon" aria-label="החלפת ערכת נושא">◐</button>
-    </div>
-  </header>
-
-  <main class="layout">
-    <!-- פאנל קבצים -->
-    <aside class="panel files-panel" aria-label="קבצים בדרייב">
-      <div class="panel-head">
-        <h2>חוזים בדרייב</h2>
-        <span id="fileCount" class="badge">0</span>
-      </div>
-
-      <label id="dropZone" class="dropzone" for="fileInput">
-        <input id="fileInput" type="file" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.webp" multiple hidden />
-        <strong>גרור לכאן קבצים</strong>
-        <span>או לחץ לבחירה · PDF / תמונות סרוקות</span>
-      </label>
-
-      <div id="uploadProgress" class="upload-progress" hidden>
-        <div class="upload-bar"><i></i></div>
-        <span class="small muted"></span>
-      </div>
-
-      <input id="fileSearch" class="input" type="search" placeholder="סינון לפי שם קובץ…" />
-
-      <ul id="fileList" class="file-list" aria-live="polite"></ul>
-      <p id="syncInfo" class="muted small"></p>
-    </aside>
-
-    <!-- פאנל צ'אט -->
-    <section class="panel chat-panel" aria-label="צ'אט עם הסוכן">
-      <div class="quick-actions">
-        <!-- data-report: נשלף ישירות מ-SQL (0 טוקנים) · data-analysis: דורש LLM -->
-        <button class="chip" data-report="expiring" title="מיידי, ללא עלות טוקנים">⏳ חוזים שמסתיימים</button>
-        <button class="chip" data-report="financial" title="מיידי, ללא עלות טוקנים">₪ תנאים כספיים</button>
-        <button class="chip" data-report="status" title="מיידי, ללא עלות טוקנים">◉ סטטוס אינדקס</button>
-        <button class="chip" data-analysis="risks" title="ניתוח AI של סעיפי החוזים">⚠ סעיפי סיכון</button>
-      </div>
-
-      <div id="messages" class="messages" aria-live="polite"></div>
-
-      <template id="emptyStateTpl">
-        <div class="empty-state">
-          <h3>שלום, במה אפשר לעזור?</h3>
-          <p>שאל על כל חוזה בתיקייה: צדדים, תוקף, דמי שכירות, גוש/חלקה, אופציות וסעיפים מיוחדים.</p>
-          <div class="examples">
-            <button class="example">מה גובה דמי השכירות בחוזה של גוש 6623?</button>
-            <button class="example">השווה בין שני החוזים האחרונים בנושא אופציית הארכה</button>
-            <button class="example">הפק מכתב הודעה על סיום חוזה לשוכר</button>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>סוכן חוזים | יחידת נכסים</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/lucide-static@0.469.0/font/lucide.css"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <!-- סרגל צד -->
+      <aside id="sidebar" class="sidebar" aria-label="חוזים בדרייב">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">§</span>
+          <div class="brand-text">
+            <div class="brand-title">סוכן חוזים</div>
+            <div class="brand-sub">יחידת נכסים</div>
           </div>
         </div>
-      </template>
 
-      <button id="jumpBtn" class="jump-btn" type="button" hidden>↓ הודעה חדשה</button>
+        <button id="newChatBtn" class="btn-accent" type="button">
+          <i class="icon-plus"></i>שיחה חדשה
+        </button>
 
-      <div class="composer-wrap">
-        <div id="focusBar" class="focus-bar" hidden></div>
-        <form id="chatForm" class="composer">
-          <textarea id="chatInput" rows="1" placeholder="כתוב שאלה על החוזים… (Enter לשליחה, Shift+Enter לשורה חדשה)"></textarea>
-          <button id="sendBtn" class="btn btn-primary" type="submit">שליחה</button>
-        </form>
-      </div>
-    </section>
-  </main>
+        <div class="search">
+          <i class="icon-search" aria-hidden="true"></i>
+          <input id="fileSearch" type="search" placeholder="חיפוש חוזה…" />
+        </div>
 
-  <!-- כרטיס חוזה: מטא-דאטה מקומי, ללא LLM -->
-  <dialog id="fileDialog" class="file-dialog">
-    <form method="dialog" class="dialog-head">
-      <h3 id="fdTitle"></h3>
-      <button class="btn-icon" aria-label="סגירה">✕</button>
-    </form>
-    <dl id="fdMeta" class="meta-grid"></dl>
-    <div class="dialog-actions">
-      <button id="fdFocus" class="btn btn-primary" type="button">📎 שאל על החוזה הזה</button>
-      <a id="fdLink" class="btn btn-ghost" target="_blank" rel="noopener">פתח בדרייב</a>
-      <button id="fdReindex" class="btn btn-ghost" type="button" hidden>⟳ נסה לאנדקס שוב</button>
-      <button id="fdDelete" class="btn btn-ghost danger" type="button">🗑 מחיקה</button>
+        <div class="files-head">
+          <span>חוזים בדרייב</span>
+          <span id="fileCount">0</span>
+        </div>
+
+        <ul id="fileList" class="file-list" aria-live="polite"></ul>
+
+        <div id="uploadProgress" class="upload-progress" hidden>
+          <div class="upload-bar"><i></i></div>
+          <span></span>
+        </div>
+
+        <input
+          id="fileInput"
+          type="file"
+          accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff,.webp"
+          multiple
+          hidden
+        />
+        <button
+          id="uploadBtn"
+          class="btn-upload"
+          type="button"
+          title="או גרור קבצים לסרגל · PDF / תמונות סרוקות"
+        >
+          <i class="icon-upload"></i>העלאת חוזה
+        </button>
+
+        <div class="sync">
+          <button
+            id="syncBtn"
+            class="sync-btn"
+            type="button"
+            title="סנכרון Delta מול הדרייב"
+          >
+            <i class="icon-refresh-cw"></i>
+          </button>
+          <div id="syncInfo" class="sync-info"></div>
+        </div>
+      </aside>
+
+      <!-- צ'אט -->
+      <main class="chat" aria-label="צ'אט עם הסוכן">
+        <div id="messages" class="messages" aria-live="polite">
+          <div id="messageList" class="message-list"></div>
+        </div>
+
+        <template id="emptyStateTpl">
+          <div class="empty-state">
+            <div class="empty-title">שלום, במה אפשר לעזור?</div>
+            <div class="empty-sub">
+              שאל על כל חוזה בתיקייה: צדדים, תוקף, דמי שכירות, גוש/חלקה, אופציות
+              וסעיפים מיוחדים.
+            </div>
+          </div>
+        </template>
+
+        <button id="jumpBtn" class="jump-btn" type="button" hidden>
+          <i class="icon-arrow-down"></i>הודעה חדשה
+        </button>
+
+        <div class="composer-area">
+          <div class="quick-actions">
+            <!-- data-report: נשלף ישירות מ-SQL (0 טוקנים) · data-analysis: דורש LLM -->
+            <button
+              class="chip"
+              data-report="expiring"
+              title="מיידי, ללא עלות טוקנים"
+            >
+              <i class="icon-hourglass"></i>חוזים שמסתיימים
+            </button>
+            <button
+              class="chip"
+              data-report="financial"
+              title="מיידי, ללא עלות טוקנים"
+            >
+              <i class="icon-banknote"></i>תנאים כספיים
+            </button>
+            <button
+              class="chip"
+              data-report="status"
+              title="מיידי, ללא עלות טוקנים"
+            >
+              <i class="icon-activity"></i>סטטוס אינדקס
+            </button>
+            <button
+              class="chip"
+              data-analysis="risks"
+              title="ניתוח AI של סעיפי החוזים"
+            >
+              <i class="icon-triangle-alert"></i>סעיפי סיכון
+            </button>
+          </div>
+
+          <form id="chatForm" class="composer">
+            <div id="focusBar" class="focus-bar" hidden></div>
+            <div class="composer-row">
+              <textarea
+                id="chatInput"
+                rows="1"
+                placeholder="כתוב שאלה על החוזים…"
+              ></textarea>
+              <button id="sendBtn" class="send-btn" type="submit" title="שליחה">
+                <i class="icon-arrow-up"></i>
+              </button>
+            </div>
+          </form>
+          <div class="composer-hint">Enter לשליחה · Shift+Enter לשורה חדשה</div>
+        </div>
+      </main>
     </div>
-  </dialog>
 
-  <div id="toast" class="toast" role="status" hidden></div>
+    <!-- כרטיס חוזה: מטא-דאטה מקומי, ללא LLM -->
+    <dialog id="fileDialog" class="file-dialog">
+      <form method="dialog" class="dialog-head">
+        <h3 id="fdTitle"></h3>
+        <button class="icon-btn" aria-label="סגירה">
+          <i class="icon-x"></i>
+        </button>
+      </form>
+      <dl id="fdMeta" class="meta-grid"></dl>
+      <div class="dialog-actions">
+        <button id="fdFocus" class="btn-accent" type="button">
+          <i class="icon-paperclip"></i>שאל על החוזה הזה
+        </button>
+        <a id="fdLink" class="btn-ghost" target="_blank" rel="noopener"
+          ><i class="icon-external-link"></i>פתח בדרייב</a
+        >
+        <button id="fdReindex" class="btn-ghost" type="button" hidden>
+          <i class="icon-refresh-cw"></i>נסה לאנדקס שוב
+        </button>
+        <button id="fdDelete" class="btn-ghost danger" type="button">
+          <i class="icon-trash-2"></i>מחיקה
+        </button>
+      </div>
+    </dialog>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
-  <script src="app.js"></script>
-</body>
+    <div id="toast" class="toast" role="status" hidden></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+    <script src="app.js"></script>
+  </body>
 </html>
