@@ -957,7 +957,9 @@ a.source-chip:hover {
   background: transparent;
   padding: 6px 8px;
   margin: -6px -8px;
-  font: 600 17px "Heebo", sans-serif;
+  font:
+    600 17px "Heebo",
+    sans-serif;
   color: var(--text);
 }
 .draft-title:hover,

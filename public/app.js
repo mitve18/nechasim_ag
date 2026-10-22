@@ -568,12 +568,14 @@
   draftEls.cancel.addEventListener("click", () => draftEls.dialog.close());
 
   // סרגל כלים: execCommand עדיין נתמך בכל הדפדפנים ומספיק לעיצוב בסיסי של מכתב
-  draftEls.dialog.querySelector(".draft-toolbar").addEventListener("mousedown", (e) => {
-    const btn = e.target.closest("[data-cmd]");
-    if (!btn) return;
-    e.preventDefault(); // לא לגנוב את הפוקוס/הבחירה מהעורך
-    document.execCommand(btn.dataset.cmd, false, btn.dataset.arg || null);
-  });
+  draftEls.dialog
+    .querySelector(".draft-toolbar")
+    .addEventListener("mousedown", (e) => {
+      const btn = e.target.closest("[data-cmd]");
+      if (!btn) return;
+      e.preventDefault(); // לא לגנוב את הפוקוס/הבחירה מהעורך
+      document.execCommand(btn.dataset.cmd, false, btn.dataset.arg || null);
+    });
 
   // הדבקה כטקסט נקי - מונע עיצובים זרים (Word/אתרים) שלא יעברו טוב למסמך
   draftEls.editor.addEventListener("paste", (e) => {
@@ -598,7 +600,11 @@
       const doc = await api("/api/docs/export-html", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: d.title.slice(0, 200), html, doc_type: d.doc_type }),
+        body: JSON.stringify({
+          title: d.title.slice(0, 200),
+          html,
+          doc_type: d.doc_type,
+        }),
       });
       downloadDoc(doc);
       draftEls.dialog.close();
@@ -867,11 +873,16 @@
   function setUploading(value) {
     uploading = value;
     els.uploadBtn.disabled = value;
-    els.uploadBtn.innerHTML = value ? `<i class="icon-loader-circle spin"></i>מעלה…` : uploadBtnHtml;
+    els.uploadBtn.innerHTML = value
+      ? `<i class="icon-loader-circle spin"></i>מעלה…`
+      : uploadBtnHtml;
   }
 
   async function uploadFiles(list) {
-    if (uploading) { toast("העלאה כבר מתבצעת - המתן לסיומה"); return; }
+    if (uploading) {
+      toast("העלאה כבר מתבצעת - המתן לסיומה");
+      return;
+    }
     const bar = els.uploadProgress.querySelector("i");
     const label = els.uploadProgress.querySelector("span");
     let ok = 0;
@@ -893,7 +904,8 @@
                 : `${prefix}שומר בדרייב…`;
           });
           ok++;
-          if (list.length === 1) toast(`✓ ${file.name} הועלה - מתבצע אינדוקס ברקע`);
+          if (list.length === 1)
+            toast(`✓ ${file.name} הועלה - מתבצע אינדוקס ברקע`);
         } catch (err) {
           failed.push(file.name);
           toast(`✕ ${file.name}: ${err.message}`, 8000);
@@ -901,9 +913,12 @@
         await loadFiles();
       }
       if (list.length > 1) {
-        toast(failed.length
-          ? `הועלו ${ok} מתוך ${list.length}. נכשלו: ${failed.join(", ")}`
-          : `✓ כל ${ok} הקבצים הועלו - מתבצע אינדוקס ברקע`, failed.length ? 8000 : 3500);
+        toast(
+          failed.length
+            ? `הועלו ${ok} מתוך ${list.length}. נכשלו: ${failed.join(", ")}`
+            : `✓ כל ${ok} הקבצים הועלו - מתבצע אינדוקס ברקע`,
+          failed.length ? 8000 : 3500,
+        );
       }
     } finally {
       bar.style.width = "0";
@@ -912,7 +927,9 @@
     }
   }
 
-  els.uploadBtn.addEventListener("click", () => { if (!uploading) els.fileInput.click(); });
+  els.uploadBtn.addEventListener("click", () => {
+    if (!uploading) els.fileInput.click();
+  });
   els.fileInput.addEventListener("change", () => {
     if (els.fileInput.files.length) uploadFiles([...els.fileInput.files]);
     els.fileInput.value = "";
